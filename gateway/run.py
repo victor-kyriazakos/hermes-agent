@@ -2458,20 +2458,25 @@ def _gateway_config_home() -> Path:
     return _hermes_home
 
 
-def _load_gateway_config() -> dict:
-    """Load and parse ~/.hermes/config.yaml, returning {} on any error.
+def _load_gateway_config(*, strict: bool = False) -> dict:
+    """Load and parse ~/.hermes/config.yaml.
+
+    By default, preserve the gateway's historical fail-open behavior and return
+    ``{}`` on errors. ``strict=True`` distinguishes an absent or empty config from
+    invalid YAML / non-mapping data for security-sensitive identity resolution.
 
     Uses the module-level ``_hermes_home`` (so tests that monkeypatch it
     still see their fixture) and shares the mtime-keyed raw-yaml cache
-    from ``hermes_cli.config.read_raw_config`` when the paths match.
+    from ``hermes_cli.config.read_raw_config`` when the paths match and strict
+    validation is not requested.
 
     Managed scope is overlaid on the result (via the shared helper) so the
-    gateway honors administrator-pinned values — neither read_raw_config nor a
-    direct yaml.safe_load carries the managed merge on its own. Fail-open.
+    gateway honors administrator-pinned values. The default path remains
+    fail-open; strict validation raises instead.
     """
     config_home = _gateway_config_home()
     config_path = config_home / 'config.yaml'
-    raw: dict = {}
+    raw: object = {}
     used_canonical = False
     try:
         from hermes_cli.config import get_config_path, read_raw_config
@@ -2479,7 +2484,7 @@ def _load_gateway_config() -> dict:
         # location, reuse the shared cache. Otherwise fall through to a
         # direct read (keeps test fixtures with a monkeypatched
         # _hermes_home working).
-        if config_path == get_config_path():
+        if not strict and config_path == get_config_path():
             raw = read_raw_config()
             used_canonical = True
     except Exception:
@@ -2490,10 +2495,18 @@ def _load_gateway_config() -> dict:
             if config_path.exists():
                 import yaml
                 with open(config_path, 'r', encoding='utf-8') as f:
-                    raw = yaml.safe_load(f) or {}
-        except Exception:
+                    parsed = yaml.safe_load(f)
+                    raw = {} if parsed is None else parsed
+        except Exception as exc:
             logger.debug("Could not load gateway config from %s", config_path)
+            if strict:
+                raise RuntimeError("Could not parse gateway config") from exc
             raw = {}
+
+    if not isinstance(raw, dict):
+        if strict:
+            raise RuntimeError("gateway config must be a mapping")
+        return {}
 
     # Overlay managed scope. read_raw_config() returns the user's raw YAML
     # WITHOUT the managed merge (that lives in load_config/_load_config_impl),
@@ -2502,9 +2515,12 @@ def _load_gateway_config() -> dict:
     try:
         from hermes_cli import managed_scope
         raw = managed_scope.apply_managed_overlay(raw if isinstance(raw, dict) else {})
-    except Exception:
-        pass
+    except Exception as exc:
+        if strict:
+            raise RuntimeError("Could not apply managed gateway config") from exc
     if not isinstance(raw, dict):
+        if strict:
+            raise RuntimeError("managed gateway config must be a mapping")
         return {}
     # Canonicalize model-id aliases (model.name / model.model → model.default)
     # and migrate stale root-level provider/base_url into the model section.

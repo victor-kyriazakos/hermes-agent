@@ -251,6 +251,16 @@ stopped.
 
 `hermes gateway enroll` accepts `--token`, `--connector-url`, `--gateway-id`, and `--wake-url`. It exchanges the enrollment token with the connector and writes the resulting `GATEWAY_RELAY_ID`, `GATEWAY_RELAY_SECRET`, `GATEWAY_RELAY_DELIVERY_KEY`, optional `GATEWAY_RELAY_URL`, and (when `--wake-url` is given) `GATEWAY_RELAY_WAKE_URL` values to the active profile's `.env`.
 
+For relay enrollment and boot-time self-provisioning, an explicit `GATEWAY_RELAY_IDP_TOKEN_URL` OAuth2 client-credentials configuration has highest precedence. Self-hosted platforms can instead provide a rotating workload identity token through `config.yaml`:
+
+```yaml
+gateway:
+  idp:
+    token_file: /var/run/secrets/hermes/identity-token
+```
+
+The token file takes precedence over OAuth2 client credentials in `config.yaml`, is read again for every resolution so projected-token rotation does not require a restart, and must contain one non-empty UTF-8 line no larger than 65,536 bytes. A configured file that is unreadable or invalid fails closed instead of falling through to another identity. Restrict the file to the Hermes service account, for example mode `0600`. If neither environment OAuth2, `token_file`, nor config-file OAuth2 is configured, Hermes retains the existing Nous Portal fallback.
+
 :::tip WSL users
 Use `hermes gateway run` instead of `hermes gateway start` — WSL's systemd support is unreliable. Wrap it in tmux for persistence: `tmux new -s hermes 'hermes gateway run'`. See [WSL FAQ](/reference/faq#wsl-gateway-keeps-disconnecting-or-hermes-gateway-start-fails) for details.
 :::

@@ -437,20 +437,52 @@ def _post_provision(
     return payload
 
 
+_AMBIENT_IDENTITY_TOKEN_MAX_BYTES = 64 * 1024
+
+
+def _resolve_ambient_identity_token(token_file: str) -> str | None:
+    """Read an operator-provided workload token without caching it."""
+    if not token_file:
+        return None
+    source = "gateway.idp.token_file"
+    try:
+        with open(token_file, "rb") as handle:
+            raw = handle.read(_AMBIENT_IDENTITY_TOKEN_MAX_BYTES + 1)
+    except OSError as exc:
+        raise RuntimeError(f"{source} could not be read: {exc}") from exc
+
+    if len(raw) > _AMBIENT_IDENTITY_TOKEN_MAX_BYTES:
+        raise RuntimeError(f"{source} exceeds 65536 bytes")
+    try:
+        token_text = raw.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise RuntimeError(f"{source} is not valid UTF-8") from exc
+    if token_text.endswith("\r\n"):
+        token_text = token_text[:-2]
+    elif token_text.endswith(("\n", "\r")):
+        token_text = token_text[:-1]
+    if "\n" in token_text or "\r" in token_text:
+        raise RuntimeError(f"{source} must contain exactly one line")
+    token = token_text.strip()
+    if not token:
+        raise RuntimeError(f"{source} is empty")
+    return token
+
+
 def _resolve_relay_identity_token() -> str:
     """Resolve the caller-identity bearer token the connector introspects to a tenant.
 
     Canonical resolver shared by the runtime self-provision path and the
-    ``hermes gateway enroll`` CLI. Two modes, in precedence order:
+    ``hermes gateway enroll`` CLI. Modes, in precedence order:
 
-      1. **Generic OIDC client-credentials** (air-gapped / self-hosted-IdP, NO
-         Nous Portal): when ``gateway.idp.token_url`` (or
-         ``GATEWAY_RELAY_IDP_TOKEN_URL``) is configured, obtain a workload access
-         token via the OAuth2 ``client_credentials`` grant against the operator's
-         own IdP (Entra; Authentik in the sandbox). The connector's Seam-A OIDC
-         verifier reads a claim (default ``tid``) off it as the tenant.
-      2. **Nous Portal** (default): ``resolve_nous_access_token()`` — existing
-         managed/hosted behaviour.
+      1. **Environment-configured OIDC client credentials**: an explicit
+         ``GATEWAY_RELAY_IDP_TOKEN_URL`` deployment override wins over config.
+      2. **Ambient workload identity**: when ``gateway.idp.token_file`` is
+         configured, read the token supplied by the platform. The file is re-read
+         on every resolution so rotation is seen.
+      3. **Config-file OIDC client credentials**: obtain a workload access token
+         via the OAuth2 ``client_credentials`` grant against the operator's IdP.
+      4. **Nous Portal** (default): ``resolve_nous_access_token()``.
 
     Raises on failure; callers decide whether that's fatal (enroll CLI) or a
     graceful boot no-op (self-provision).
@@ -460,24 +492,40 @@ def _resolve_relay_identity_token() -> str:
     client_secret = os.environ.get("GATEWAY_RELAY_IDP_CLIENT_SECRET", "").strip()
     scope = os.environ.get("GATEWAY_RELAY_IDP_SCOPE", "").strip()
     if not token_url:
-        try:
-            from gateway.run import _load_gateway_config  # late import to avoid cycle
+        from gateway.run import _load_gateway_config  # late import to avoid cycle
 
-            idp = ((_load_gateway_config().get("gateway") or {}).get("idp") or {})
-            token_url = str(idp.get("token_url", "") or "").strip()
-            client_id = client_id or str(idp.get("client_id", "") or "").strip()
-            client_secret = client_secret or str(idp.get("client_secret", "") or "").strip()
-            scope = scope or str(idp.get("scope", "") or "").strip()
-        except Exception:  # noqa: BLE001 - config absence must not crash
-            token_url = token_url or ""
+        loaded_config = _load_gateway_config(strict=True)
+        if not isinstance(loaded_config, dict):
+            raise RuntimeError("gateway config must be a mapping")
+        gateway_config = loaded_config.get("gateway")
+        if gateway_config is None:
+            gateway_config = {}
+        if not isinstance(gateway_config, dict):
+            raise RuntimeError("gateway must be a mapping")
+        idp_config = gateway_config.get("idp")
+        if idp_config is None:
+            idp_config = {}
+        if not isinstance(idp_config, dict):
+            raise RuntimeError("gateway.idp must be a mapping")
+        idp = idp_config
+
+        token_file = str(idp.get("token_file", "") or "").strip()
+        ambient_token = _resolve_ambient_identity_token(token_file)
+        if ambient_token is not None:
+            return ambient_token
+
+        token_url = str(idp.get("token_url", "") or "").strip()
+        client_id = client_id or str(idp.get("client_id", "") or "").strip()
+        client_secret = client_secret or str(idp.get("client_secret", "") or "").strip()
+        scope = scope or str(idp.get("scope", "") or "").strip()
 
     if not token_url:
-        # Mode 2 — Nous Portal (default, unchanged behaviour).
+        # Mode 4 — Nous Portal (default, unchanged behaviour).
         from hermes_cli.auth import resolve_nous_access_token
 
         return resolve_nous_access_token()
 
-    # Mode 1 — generic OAuth2 client_credentials grant.
+    # Modes 1 and 3 — generic OAuth2 client_credentials grant.
     import json
     import urllib.error
     import urllib.parse
@@ -515,10 +563,11 @@ def self_provision_relay() -> bool:
     """Boot-time relay self-provision: mint relay creds in-process, no human, no disk.
 
     Fires when relay is configured (``relay_url()`` set) and NO per-gateway secret
-    is already present, AND the agent can resolve its own Nous access token. In
-    that case the runtime resolves the agent's own Nous access token (the same
-    ``resolve_nous_access_token()`` the enroll CLI / dashboard register use),
-    POSTs ``/relay/provision`` asserting its own endpoint + route keys, and sets
+    is already present, AND the agent can resolve a caller-identity token. The
+    canonical resolver accepts an environment-configured IdP, an ambient workload
+    token from ``gateway.idp.token_file``, config-file OAuth2 client credentials,
+    or the existing Nous Portal login. The runtime POSTs ``/relay/provision``
+    asserting its endpoint + route keys and sets
     ``GATEWAY_RELAY_ID`` / ``GATEWAY_RELAY_SECRET`` / ``GATEWAY_RELAY_DELIVERY_KEY``
     into ``os.environ`` so the subsequent ``register_relay_adapter()`` picks them
     up. The creds live ONLY in process memory — never written to ``~/.hermes/.env``.
@@ -534,8 +583,8 @@ def self_provision_relay() -> bool:
         bootstrapped NAS token -> self-provisions.
       - A self-hosted operator who ran ``hermes gateway enroll``: has a PINNED
         ``GATEWAY_RELAY_SECRET`` -> skipped (the secret-present guard below).
-      - A self-hosted box with a relay URL but no NAS identity:
-        ``resolve_nous_access_token()`` fails -> graceful no-op.
+      - A self-hosted box with a relay URL but no configured identity source:
+        token resolution fails -> graceful no-op.
 
     Stateless: process-env creds don't survive a restart, so a hosted container
     re-provisions every boot; the connector's rotation window covers a still-

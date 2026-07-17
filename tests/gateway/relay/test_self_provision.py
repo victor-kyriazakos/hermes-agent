@@ -35,7 +35,7 @@ def _clean_env(monkeypatch):
     ):
         monkeypatch.delenv(k, raising=False)
     # Never read config.yaml off disk in these tests.
-    monkeypatch.setattr("gateway.run._load_gateway_config", lambda: {}, raising=False)
+    monkeypatch.setattr("gateway.run._load_gateway_config", lambda **_: {}, raising=False)
 
 
 def _stub_post(captured: dict):
@@ -97,7 +97,7 @@ def test_relay_instance_id_absent_is_none():
 def test_relay_instance_id_from_config(monkeypatch):
     monkeypatch.setattr(
         "gateway.run._load_gateway_config",
-        lambda: {"gateway": {"relay_instance_id": "inst-from-config"}},
+        lambda **_: {"gateway": {"relay_instance_id": "inst-from-config"}},
         raising=False,
     )
     assert relay.relay_instance_id() == "inst-from-config"
@@ -270,7 +270,7 @@ def test_relay_wake_url_absent_is_none():
 def test_relay_wake_url_from_config(monkeypatch):
     monkeypatch.setattr(
         "gateway.run._load_gateway_config",
-        lambda: {"gateway": {"relay_wake_url": "https://wake.from-config/poke"}},
+        lambda **_: {"gateway": {"relay_wake_url": "https://wake.from-config/poke"}},
         raising=False,
     )
     assert relay.relay_wake_url() == "https://wake.from-config/poke"

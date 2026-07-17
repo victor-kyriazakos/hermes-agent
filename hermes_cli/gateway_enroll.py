@@ -5,11 +5,11 @@ customer-managed and internet-exposed). This command is the gateway half of the
 zero-touch enrollment in the connector repo's
 ``docs/connector-gateway-auth-design.md``:
 
-  1. Resolve a fresh Nous Portal access token from the existing login
-     (``~/.hermes/auth.json``) — the same path ``hermes dashboard register``
-     uses (``resolve_nous_access_token``). This proves *which Nous org (tenant)*
-     the caller owns; the connector derives the authoritative tenant from it via
-     ``GET /api/oauth/account`` (never from anything the gateway asserts).
+  1. Resolve a caller-identity bearer token through the canonical relay resolver.
+     An explicit environment-configured IdP wins; otherwise the resolver checks
+     ``gateway.idp.token_file``, config-file OAuth2 client credentials, then the
+     existing Nous Portal login. The connector derives the authoritative tenant
+     from the verified token, never from gateway assertions.
   2. POST ``{enrollmentToken, gatewayId}`` to the connector's ``/relay/enroll``
      with that token in the ``Authorization`` header, over TLS.
   3. The connector verifies the enrollment token (signature + single-use +
@@ -90,9 +90,9 @@ def _resolve_identity_token() -> str:
     """Resolve the caller-identity bearer token (generic-OIDC or Nous Portal).
 
     Delegates to the canonical resolver in ``gateway.relay`` so the enroll CLI and
-    the runtime self-provision path share ONE implementation (generic OAuth2
-    client-credentials when ``gateway.idp.token_url`` is set — the air-gapped /
-    self-hosted-IdP path; otherwise Nous Portal). Raises RuntimeError on failure.
+    runtime self-provision share one precedence chain: environment-configured
+    OAuth2 client credentials, ambient ``token_file``, config-file OAuth2 client
+    credentials, then Nous Portal. Raises RuntimeError on failure.
     """
     from gateway.relay import _resolve_relay_identity_token
 
@@ -194,9 +194,9 @@ def cmd_gateway_enroll(args) -> None:
 
     gateway_id = (getattr(args, "gateway_id", None) or _default_gateway_id()).strip()
 
-    # 1. Resolve the caller-identity token (the tenant-proving identity). Generic
-    #    OIDC client-credentials when an IdP token endpoint is configured (air-
-    #    gapped / self-hosted-IdP, NO Nous Portal); otherwise the Nous Portal token.
+    # 1. Resolve the tenant-proving caller identity. Precedence is explicit IdP
+    #    environment override, ambient gateway.idp.token_file, config-file IdP,
+    #    then Nous Portal.
     try:
         access_token = _resolve_identity_token()
     except AuthError as exc:
