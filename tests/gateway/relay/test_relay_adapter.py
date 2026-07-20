@@ -234,6 +234,56 @@ async def test_send_preserves_explicit_user_id():
 
 
 @pytest.mark.asyncio
+async def test_edit_message_forwards_relay_action_with_routing_context():
+    t = _CaptureTransport()
+    a = RelayAdapter(PlatformConfig(), make_desc(platform="slack"), transport=t)
+    event = _make_event(chat_id="channel-1", scope_id="workspace-1")
+    event.source.platform = Platform.SLACK
+    a._capture_scope(event)
+
+    result = await a.edit_message(
+        "channel-1",
+        "message-1",
+        "streamed answer",
+        metadata={"thread_id": "thread-1"},
+    )
+
+    assert result.success is True
+    assert t.sent == {
+        "op": "edit",
+        "chat_id": "channel-1",
+        "message_id": "message-1",
+        "content": "streamed answer",
+        "metadata": {
+            "thread_id": "thread-1",
+            "scope_id": "workspace-1",
+        },
+    }
+    assert t.sent_platform == "slack"
+
+
+@pytest.mark.asyncio
+async def test_send_typing_forwards_relay_action_with_routing_context():
+    t = _CaptureTransport()
+    a = RelayAdapter(PlatformConfig(), make_desc(platform="slack"), transport=t)
+    event = _make_event(chat_id="channel-1", scope_id="workspace-1")
+    event.source.platform = Platform.SLACK
+    a._capture_scope(event)
+
+    await a.send_typing("channel-1", metadata={"thread_id": "thread-1"})
+
+    assert t.sent == {
+        "op": "typing",
+        "chat_id": "channel-1",
+        "metadata": {
+            "thread_id": "thread-1",
+            "scope_id": "workspace-1",
+        },
+    }
+    assert t.sent_platform == "slack"
+
+
+@pytest.mark.asyncio
 async def test_scoped_reply_does_not_carry_user_id():
     """A scoped reply resolves by scope_id and must NOT carry a DM user_id even if
     the same chat_id was somehow seen — scope capture wins and user_id stays out
