@@ -1,0 +1,6 @@
+{
+  "$schema": "https://railway.com/railway.schema.json",
+  "deploy": {
+    "startCommand": "/opt/hermes/docker/railway-direct-wrapper.sh"
+  }
+}
