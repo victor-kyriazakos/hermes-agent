@@ -1,5 +1,6 @@
 import os
 from pathlib import Path
+import shlex
 import subprocess
 import sys
 
@@ -27,6 +28,13 @@ def test_staging_wrapper_changes_to_hermes_home_before_gateway_start() -> None:
 def test_railway_overlay_is_baked_and_uses_staging_entrypoint() -> None:
     dockerfile = (ROOT / "Dockerfile").read_text()
 
+    sync_lines = [line for line in dockerfile.splitlines() if line.startswith("RUN uv sync ")]
+    assert len(sync_lines) == 1
+    sync_args = shlex.split(sync_lines[0].removeprefix("RUN "))
+    assert sum(
+        sync_args[index : index + 2] == ["--extra", "otlp"]
+        for index in range(len(sync_args) - 1)
+    ) == 1
     assert "/opt/hermes/docker/railway-staging-wrapper.sh" in dockerfile
     assert "/opt/hermes/docker/railway-direct-wrapper.sh" in dockerfile
     assert (

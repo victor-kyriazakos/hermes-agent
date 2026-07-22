@@ -152,11 +152,12 @@ RUN npm install --prefer-offline --no-audit --fetch-retries=5 && \
 # frontend stats the readme path during dep resolution, so we `touch` an
 # empty placeholder — the real README is restored by `COPY . .` below.
 #
-# `uv sync --frozen --no-install-project --extra all --extra messaging`
+# `uv sync --frozen --no-install-project --extra all --extra messaging --extra otlp`
 # installs the deps reachable through the composite `[all]` extra
 # (handpicked set intended for the production image — excludes `[dev]`),
-# plus gateway messaging adapters that should work in the published image
-# without a first-boot lazy install.  We do NOT use `--all-extras`:
+# plus gateway messaging adapters and the explicitly enabled staging
+# monitoring exporter without a first-boot lazy install.  We do NOT use
+# `--all-extras`:
 # that would pull in `[rl]` (atroposlib + tinker + torch + wandb from
 # git), `[yc-bench]` (another git dep), and `[termux-all]` (Android
 # redundancy), none of which belong in the published container.
@@ -182,7 +183,7 @@ RUN npm install --prefer-offline --no-audit --fetch-retries=5 && \
 # The editable link is created after the source copy below.
 COPY pyproject.toml uv.lock ./
 RUN touch ./README.md
-RUN uv sync --frozen --no-install-project --extra all --extra messaging --extra anthropic --extra bedrock --extra azure-identity --extra hindsight --extra matrix
+RUN uv sync --frozen --no-install-project --extra all --extra messaging --extra anthropic --extra bedrock --extra azure-identity --extra hindsight --extra matrix --extra otlp
 
 # ---------- Frontend build (cached independently from Python source) ----------
 # Copy only the frontend source trees first so that Python-only changes don't
