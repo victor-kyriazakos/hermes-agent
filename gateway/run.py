@@ -13178,22 +13178,80 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 except Exception:
                     pass
             if not home_env:
-                # Slack dispatches all Hermes commands through a single
-                # parent slash command `/hermes`; bare `/sethome` is not
-                # registered and would fail with "app did not respond".
-                sethome_cmd = (
-                    "/hermes sethome"
-                    if source.platform == Platform.SLACK
-                    else "/sethome"
+                # Enterprise/relay: each relay-fronted pod serves ONE owner over
+                # DM, so the DM the owner is already in IS the natural home
+                # channel for cron job results and cross-platform delivery. When
+                # GATEWAY_AUTO_HOME is set (the enterprise deployment sets it),
+                # silently adopt the current DM as home instead of prompting.
+                # DM-only: a shared channel is never auto-adopted. Self-healing —
+                # if the persisted value is lost on restart, the next first DM
+                # re-adopts it.
+                auto_home = (os.getenv("GATEWAY_AUTO_HOME") or "").strip().lower() in (
+                    "1",
+                    "true",
+                    "yes",
                 )
-                notice = (
-                    f"📬 No home channel is set for {platform_name.title()}. "
-                    f"A home channel is where Hermes delivers cron job results "
-                    f"and cross-platform messages.\n\n"
-                    f"Type {sethome_cmd} to make this chat your home channel, "
-                    f"or ignore to skip."
-                )
-                await self._deliver_platform_notice(source, notice)
+                if (
+                    auto_home
+                    and getattr(source, "chat_type", None) == "dm"
+                    and source.chat_id
+                ):
+                    try:
+                        _chat_id = str(source.chat_id)
+                        # In-memory config FIRST — this is what get_home_channel()
+                        # (the cron + delivery read path) consults, and it always
+                        # succeeds. Disk persistence is best-effort below.
+                        if source.platform:
+                            _pc = self.config.platforms.setdefault(
+                                source.platform,
+                                PlatformConfig(enabled=True),
+                            )
+                            # Home is the DM itself, not a pinned thread — cron
+                            # lands in the conversation, not buried in an old
+                            # thread.
+                            _pc.home_channel = HomeChannel(
+                                platform=source.platform,
+                                chat_id=_chat_id,
+                                name=source.chat_name or _chat_id,
+                                thread_id=None,
+                            )
+                        # Persist so it survives a restart (self-healing anyway).
+                        try:
+                            from hermes_cli.config import save_env_value
+
+                            save_env_value(
+                                _home_target_env_var(platform_name), _chat_id
+                            )
+                            save_env_value(_home_thread_env_var(platform_name), "")
+                        except Exception as _persist_err:
+                            logger.debug(
+                                "auto-home persist failed (in-memory set): %s",
+                                _persist_err,
+                            )
+                        logger.info(
+                            "Auto-adopted %s DM %s as home channel (GATEWAY_AUTO_HOME)",
+                            platform_name,
+                            _chat_id,
+                        )
+                    except Exception as _ah_err:
+                        logger.debug("auto-home adopt failed: %s", _ah_err)
+                else:
+                    # Slack dispatches all Hermes commands through a single
+                    # parent slash command `/hermes`; bare `/sethome` is not
+                    # registered and would fail with "app did not respond".
+                    sethome_cmd = (
+                        "/hermes sethome"
+                        if source.platform == Platform.SLACK
+                        else "/sethome"
+                    )
+                    notice = (
+                        f"📬 No home channel is set for {platform_name.title()}. "
+                        f"A home channel is where Hermes delivers cron job results "
+                        f"and cross-platform messages.\n\n"
+                        f"Type {sethome_cmd} to make this chat your home channel, "
+                        f"or ignore to skip."
+                    )
+                    await self._deliver_platform_notice(source, notice)
         
         # -----------------------------------------------------------------
         # Voice channel awareness — deliver current voice channel state so

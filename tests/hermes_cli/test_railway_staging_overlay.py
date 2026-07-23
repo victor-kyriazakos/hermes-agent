@@ -1,0 +1,183 @@
+import os
+from pathlib import Path
+import subprocess
+import sys
+
+import yaml
+
+
+ROOT = Path(__file__).resolve().parents[2]
+
+
+def test_staging_wrapper_changes_to_hermes_home_before_gateway_start() -> None:
+    wrapper = (ROOT / "docker" / "railway-staging-wrapper.sh").read_text()
+
+    home = 'home="${HERMES_HOME:-/opt/data}"'
+    export_home = 'export HERMES_HOME="$home"'
+    first_config = "hermes config set model.default"
+    change_directory = 'cd "$home"'
+    gateway_start = "exec /opt/hermes/docker/main-wrapper.sh gateway run"
+
+    assert home in wrapper
+    assert wrapper.startswith("#!/command/with-contenv sh\n")
+    assert wrapper.index(export_home) < wrapper.index(first_config)
+    assert wrapper.index(change_directory) < wrapper.index(gateway_start)
+
+
+def test_railway_overlay_is_baked_and_uses_staging_entrypoint() -> None:
+    dockerfile = (ROOT / "Dockerfile").read_text()
+
+    assert "/opt/hermes/docker/railway-staging-wrapper.sh" in dockerfile
+    assert "/opt/hermes/docker/railway-direct-wrapper.sh" in dockerfile
+    assert (
+        'ENTRYPOINT [ "/init", "/opt/hermes/docker/railway-staging-wrapper.sh" ]'
+        in dockerfile
+    )
+
+
+def test_railway_wrappers_cannot_reset_the_persistent_home() -> None:
+    for name in ("railway-staging-wrapper.sh", "railway-direct-wrapper.sh"):
+        wrapper = (ROOT / "docker" / name).read_text()
+
+        assert "HERMES_RESET_GENERATION" not in wrapper
+        assert "rm -rf" not in wrapper
+        assert "chown -R" not in wrapper
+
+
+def test_railway_wrappers_enable_private_staging_health_export() -> None:
+    required = (
+        "monitoring.gateway_health_export.enabled true",
+        "monitoring.gateway_health_export.metrics_enabled true",
+        "monitoring.gateway_health_export.diagnostic_events_enabled true",
+        "monitoring.export.otlp.enabled true",
+        "http://otel-collector.railway.internal:4318/v1/traces",
+    )
+    for name in ("railway-staging-wrapper.sh", "railway-direct-wrapper.sh"):
+        wrapper = (ROOT / "docker" / name).read_text()
+
+        for setting in required:
+            assert setting in wrapper
+
+
+def test_railway_wrappers_preflight_cli_and_enable_slack_terminal_additively() -> None:
+    required = (
+        "command -v hermes >/dev/null",
+        "/opt/hermes/.venv/bin/hermes --version >/dev/null",
+        "/opt/hermes/.venv/bin/python -m hermes_cli.main --help >/dev/null",
+        "hermes_runtime_cli_preflight=passed",
+        "/opt/hermes/docker/ensure_platform_toolset.py slack terminal",
+    )
+    for name in ("railway-staging-wrapper.sh", "railway-direct-wrapper.sh"):
+        wrapper = (ROOT / "docker" / name).read_text()
+
+        for command in required:
+            assert command in wrapper
+
+
+def test_terminal_enablement_preserves_existing_slack_toolsets(tmp_path: Path) -> None:
+    env = os.environ.copy()
+    env["HERMES_HOME"] = str(tmp_path)
+    (tmp_path / "config.yaml").write_text(
+        yaml.safe_dump({"platform_toolsets": {"slack": ["web", "memory"]}})
+    )
+
+    result = subprocess.run(
+        [
+            sys.executable,
+            str(ROOT / "docker" / "ensure_platform_toolset.py"),
+            "slack",
+            "terminal",
+        ],
+        cwd=ROOT,
+        env=env,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+
+    config_path = tmp_path / "config.yaml"
+    config = yaml.safe_load(config_path.read_text())
+    assert set(config["platform_toolsets"]["slack"]) == {"web", "memory", "terminal"}
+    assert result.stdout.strip() == "hermes_platform_toolset=added"
+
+    before = config_path.read_text()
+    repeated = subprocess.run(
+        [
+            sys.executable,
+            str(ROOT / "docker" / "ensure_platform_toolset.py"),
+            "slack",
+            "terminal",
+        ],
+        cwd=ROOT,
+        env=env,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    assert config_path.read_text() == before
+    assert repeated.stdout.strip() == "hermes_platform_toolset=present"
+
+
+def test_terminal_enablement_leaves_default_slack_toolset_implicit(tmp_path: Path) -> None:
+    env = os.environ.copy()
+    env["HERMES_HOME"] = str(tmp_path)
+    (tmp_path / "config.yaml").write_text(yaml.safe_dump({"model": {"default": "test"}}))
+
+    result = subprocess.run(
+        [
+            sys.executable,
+            str(ROOT / "docker" / "ensure_platform_toolset.py"),
+            "slack",
+            "terminal",
+        ],
+        cwd=ROOT,
+        env=env,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+
+    config = yaml.safe_load((tmp_path / "config.yaml").read_text())
+    assert "platform_toolsets" not in config
+    assert result.stdout.strip() == "hermes_platform_toolset=default"
+
+
+def test_monitoring_settings_land_in_the_exported_hermes_home(tmp_path: Path) -> None:
+    env = os.environ.copy()
+    env["HERMES_HOME"] = str(tmp_path)
+    settings = (
+        ("monitoring.gateway_health_export.enabled", "true"),
+        ("monitoring.gateway_health_export.metrics_enabled", "true"),
+        ("monitoring.gateway_health_export.diagnostic_events_enabled", "true"),
+        ("monitoring.gateway_health_export.warning_error_events_enabled", "true"),
+        ("monitoring.gateway_health_export.export_interval_seconds", "15"),
+        ("monitoring.export.otlp.enabled", "true"),
+        (
+            "monitoring.export.otlp.endpoint",
+            "http://otel-collector.railway.internal:4318/v1/traces",
+        ),
+    )
+    for key, value in settings:
+        subprocess.run(
+            [sys.executable, "-m", "hermes_cli.main", "config", "set", key, value],
+            cwd=ROOT,
+            env=env,
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+
+    config = yaml.safe_load((tmp_path / "config.yaml").read_text())
+    gateway = config["monitoring"]["gateway_health_export"]
+    otlp = config["monitoring"]["export"]["otlp"]
+    assert gateway == {
+        "enabled": True,
+        "metrics_enabled": True,
+        "diagnostic_events_enabled": True,
+        "warning_error_events_enabled": True,
+        "export_interval_seconds": 15,
+    }
+    assert otlp == {
+        "enabled": True,
+        "endpoint": "http://otel-collector.railway.internal:4318/v1/traces",
+    }
