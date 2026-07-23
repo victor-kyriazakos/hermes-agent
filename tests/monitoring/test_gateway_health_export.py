@@ -293,6 +293,57 @@ def test_runtime_status_transition_emits_lifecycle_and_platform_events(monkeypat
     assert "redacted_message" not in platform
 
 
+def test_runtime_status_transition_keeps_non_error_states_informational(monkeypatch):
+    from agent.monitoring import emitter
+    from agent.monitoring.gateway_health import emit_runtime_status_transition
+
+    captured = []
+    monkeypatch.setattr(emitter, "emit", lambda event: captured.append(event.to_dict()))
+
+    emit_runtime_status_transition(
+        {"platforms": {"relay": {"state": "retrying"}}},
+        {"platforms": {"relay": {"state": "connecting"}}},
+    )
+    emit_runtime_status_transition(
+        {"platforms": {"relay": {"state": "connecting"}}},
+        {"platforms": {"relay": {"state": "connected"}}},
+    )
+
+    transitions = [event for event in captured if event["name"] == "platform.state_change"]
+    assert [(event["old_state"], event["new_state"]) for event in transitions] == [
+        ("retrying", "connecting"),
+        ("connecting", "connected"),
+    ]
+    assert all(event["severity"] == "info" for event in transitions)
+    assert all(event["error_class"] is None for event in transitions)
+    assert all(event["error_code"] is None for event in transitions)
+
+
+def test_runtime_status_transition_retrying_keeps_classified_failure(monkeypatch):
+    from agent.monitoring import emitter
+    from agent.monitoring.gateway_health import emit_runtime_status_transition
+
+    captured = []
+    monkeypatch.setattr(emitter, "emit", lambda event: captured.append(event.to_dict()))
+
+    emit_runtime_status_transition(
+        {"platforms": {"relay": {"state": "connecting"}}},
+        {
+            "platforms": {
+                "relay": {
+                    "state": "retrying",
+                    "error_message": "connection refused",
+                }
+            }
+        },
+    )
+
+    transition = next(event for event in captured if event["name"] == "platform.state_change")
+    assert transition["severity"] == "warning"
+    assert transition["error_class"] == "network_error"
+    assert transition["error_code"] == "network_error"
+
+
 def test_runtime_status_transition_emits_startup_failed_and_exit():
     from agent.monitoring.gateway_health import emit_runtime_status_transition
     from agent.monitoring import emitter

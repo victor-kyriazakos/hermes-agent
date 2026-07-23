@@ -385,8 +385,15 @@ def emit_runtime_status_transition(previous: Optional[dict[str, Any]], current: 
             ) if pdata.get("state") is not None else None
             if old_state == new_state or not new_state:
                 continue
-            error_code = classify_gateway_error(pdata.get("error_code") or pdata.get("error_message"))
-            severity = "error" if new_state.lower() in {"fatal", "failed", "error"} else "warning"
+            raw_error = pdata.get("error_code") or pdata.get("error_message")
+            error_code = classify_gateway_error(raw_error) if raw_error else None
+            normalized_state = new_state.lower()
+            if normalized_state in {"fatal", "failed", "error"}:
+                severity = "error"
+            elif normalized_state in {"degraded", "disconnected", "retrying", "unknown"} or error_code:
+                severity = "warning"
+            else:
+                severity = "info"
             out.append(GatewayDiagnosticEvent(
                 name="platform.state_change",
                 subsystem=f"platform.{platform}",
