@@ -1942,6 +1942,7 @@ from gateway.config import (
     HomeChannel,
     PlatformConfig,
     load_gateway_config,
+    persist_home_channel,
 )
 from gateway.session import (
     AsyncSessionStore,
@@ -1955,8 +1956,35 @@ from gateway.session import (
     is_shared_multi_user_session,
     neutralize_untrusted_inline_text,
 )
-from gateway.delivery import DeliveryRouter, looks_like_telegram_private_chat_id
+from gateway.delivery import (
+    DeliveryRouter,
+    looks_like_telegram_private_chat_id,
+    resolve_delivery_transport,
+)
 from gateway.turn_lease import SessionTurnLeaseRegistry
+
+
+def _should_auto_adopt_home(source: Any, relay_adapter: Any = None) -> bool:
+    """Allow auto-home only for authenticated, advertised Relay DMs."""
+    enabled = (os.getenv("GATEWAY_AUTO_HOME") or "").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+    }
+    platform = getattr(source, "platform", None)
+    fronts_platform = getattr(relay_adapter, "fronts_platform", None)
+    return bool(
+        enabled
+        and getattr(source, "delivered_via_upstream_relay", False) is True
+        and getattr(source, "chat_type", None) == "dm"
+        and getattr(source, "chat_id", None)
+        and getattr(source, "user_id", None)
+        and platform not in {None, Platform.LOCAL, Platform.RELAY}
+        and callable(fronts_platform)
+        and fronts_platform(platform)
+    )
+
+
 from gateway.authz_mixin import GatewayAuthorizationMixin
 from gateway.kanban_watchers import GatewayKanbanWatchersMixin
 from gateway.slash_commands import GatewaySlashCommandsMixin
@@ -13177,22 +13205,70 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 except Exception:
                     pass
             if not home_env:
-                # Slack dispatches all Hermes commands through a single
-                # parent slash command `/hermes`; bare `/sethome` is not
-                # registered and would fail with "app did not respond".
-                sethome_cmd = (
-                    "/hermes sethome"
-                    if source.platform == Platform.SLACK
-                    else "/sethome"
-                )
-                notice = (
-                    f"📬 No home channel is set for {platform_name.title()}. "
-                    f"A home channel is where Hermes delivers cron job results "
-                    f"and cross-platform messages.\n\n"
-                    f"Type {sethome_cmd} to make this chat your home channel, "
-                    f"or ignore to skip."
-                )
-                await self._deliver_platform_notice(source, notice)
+                relay_adapter = self._adapter_for_source(source)
+                if _should_auto_adopt_home(source, relay_adapter):
+                    try:
+                        chat_id = str(source.chat_id)
+                        # Keep the logical platform and connector-validated owner
+                        # discriminator on the home. Transport remains runtime-derived.
+                        home = HomeChannel(
+                            platform=source.platform,
+                            chat_id=chat_id,
+                            name=source.chat_name or chat_id,
+                            thread_id=None,
+                            user_id=str(source.user_id),
+                            scope_id=(
+                                str(source.scope_id)
+                                if getattr(source, "scope_id", None)
+                                else None
+                            ),
+                        )
+                        persist_home_channel(home)
+                        platform_config = self.config.platforms.setdefault(
+                            source.platform,
+                            PlatformConfig(enabled=False),
+                        )
+                        platform_config.home_channel = home
+                        try:
+                            from hermes_cli.config import save_env_value
+
+                            save_env_value(
+                                _home_target_env_var(platform_name),
+                                chat_id,
+                            )
+                            save_env_value(
+                                _home_thread_env_var(platform_name),
+                                "",
+                            )
+                        except Exception as persist_err:
+                            logger.debug(
+                                "auto-home legacy env persist failed (config saved): %s",
+                                persist_err,
+                            )
+                        logger.info(
+                            "Auto-adopted trusted relay %s DM %s as home channel",
+                            platform_name,
+                            chat_id,
+                        )
+                    except Exception as auto_home_err:
+                        logger.debug("auto-home adopt failed: %s", auto_home_err)
+                else:
+                    # Slack dispatches all Hermes commands through a single
+                    # parent slash command `/hermes`; bare `/sethome` is not
+                    # registered and would fail with "app did not respond".
+                    sethome_cmd = (
+                        "/hermes sethome"
+                        if source.platform == Platform.SLACK
+                        else "/sethome"
+                    )
+                    notice = (
+                        f"📬 No home channel is set for {platform_name.title()}. "
+                        f"A home channel is where Hermes delivers cron job results "
+                        f"and cross-platform messages.\n\n"
+                        f"Type {sethome_cmd} to make this chat your home channel, "
+                        f"or ignore to skip."
+                    )
+                    await self._deliver_platform_notice(source, notice)
         
         # -----------------------------------------------------------------
         # Voice channel awareness — deliver current voice channel state so
@@ -16588,10 +16664,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 return None
 
             platform = Platform(platform_str)
-            adapter = self.adapters.get(platform)
-            if not adapter:
+            transport = resolve_delivery_transport(platform, self.config, self.adapters)
+            if transport is None:
                 logger.debug(
-                    "Restart notification skipped: %s adapter not connected",
+                    "Restart notification skipped: no live transport for %s",
                     platform_str,
                 )
                 return None
@@ -16610,9 +16686,16 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 thread_id,
                 chat_type=chat_type,
                 reply_to_message_id=message_id,
-                adapter=adapter,
+                adapter=transport.adapter,
             )
-            result = await adapter.send(
+            if data.get("delivered_via_upstream_relay") is True:
+                metadata = dict(metadata or {})
+                if data.get("user_id"):
+                    metadata["user_id"] = str(data["user_id"])
+                if data.get("scope_id"):
+                    metadata["scope_id"] = str(data["scope_id"])
+            result = await transport.send(
+                platform,
                 str(chat_id),
                 "♻ Gateway restarted successfully. Your session continues.",
                 metadata=_non_conversational_metadata(metadata, platform=platform),
@@ -16657,13 +16740,16 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         skipped = skip_targets or set()
         message = "♻️ Gateway online — Hermes is back and ready."
 
-        for platform, adapter in self.adapters.items():
-            home = self.config.get_home_channel(platform)
+        for platform, platform_cfg in self.config.platforms.items():
+            home = platform_cfg.home_channel
             if not home or not home.chat_id:
                 continue
 
-            platform_cfg = self.config.platforms.get(platform)
-            if platform_cfg is not None and not platform_cfg.gateway_restart_notification:
+            transport = resolve_delivery_transport(platform, self.config, self.adapters)
+            if transport is None:
+                continue
+
+            if not platform_cfg.gateway_restart_notification:
                 logger.info(
                     "Home-channel startup notification suppressed: %s has gateway_restart_notification=false",
                     platform.value,
@@ -16679,24 +16765,24 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     platform,
                     home.chat_id,
                     home.thread_id,
-                    adapter=adapter,
+                    adapter=transport.adapter,
                 )
-                if metadata:
-                    result = await adapter.send(
+                if transport.is_relay:
+                    metadata = dict(metadata or {})
+                    if home.user_id:
+                        metadata["user_id"] = home.user_id
+                    if home.scope_id:
+                        metadata["scope_id"] = home.scope_id
+                send_metadata = _non_conversational_metadata(metadata, platform=platform)
+                if send_metadata is not None or transport.is_relay:
+                    result = await transport.send(
+                        platform,
                         str(home.chat_id),
                         message,
-                        metadata=_non_conversational_metadata(metadata, platform=platform),
+                        metadata=send_metadata,
                     )
                 else:
-                    _startup_meta = _non_conversational_metadata(platform=platform)
-                    if _startup_meta:
-                        result = await adapter.send(
-                            str(home.chat_id),
-                            message,
-                            metadata=_startup_meta,
-                        )
-                    else:
-                        result = await adapter.send(str(home.chat_id), message)
+                    result = await transport.adapter.send(str(home.chat_id), message)
                 if result is not None and getattr(result, "success", True) is False:
                     logger.warning(
                         "Home-channel startup notification failed for %s:%s: %s",
