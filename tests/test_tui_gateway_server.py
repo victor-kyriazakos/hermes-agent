@@ -5864,6 +5864,65 @@ def test_config_set_personality_preserves_history_and_returns_info(monkeypatch):
     assert ("session.info", "sid", {"model": "?"}) in emits
 
 
+def test_compress_session_history_passes_force():
+    """_compress_session_history is manual-only (session.compress RPC, slash
+    compress/compact, slash-worker mirror) — it must bypass the
+    summary-failure cooldown via force=True, matching the CLI and gateway
+    manual-compress handlers."""
+    from unittest.mock import MagicMock
+
+    agent = MagicMock()
+    agent.context_compressor = None  # keep _get_usage on the simple path
+    compressed = [{"role": "user", "content": "summary"}]
+    agent._compress_context.return_value = (compressed, "")
+    session = _session(
+        agent=agent,
+        history=[
+            {"role": "user", "content": "one"},
+            {"role": "assistant", "content": "two"},
+            {"role": "user", "content": "three"},
+            {"role": "assistant", "content": "four"},
+        ],
+    )
+
+    removed, _usage = server._compress_session_history(session)
+
+    assert removed == 3
+    assert session["history"] == compressed
+    assert agent._compress_context.call_args.kwargs.get("force") is True
+
+
+def test_compress_session_history_works_when_auto_compaction_disabled():
+    """compression.enabled: false disables *automatic* compaction only —
+    manual /compress must still work on every TUI route (session.compress
+    RPC, slash compress/compact, slash-worker mirror), all of which converge
+    on _compress_session_history. Pin that the helper never gates on
+    agent.compression_enabled (#64438)."""
+    from unittest.mock import MagicMock
+
+    agent = MagicMock()
+    agent.compression_enabled = False
+    agent.context_compressor = None  # keep _get_usage on the simple path
+    compressed = [{"role": "user", "content": "summary"}]
+    agent._compress_context.return_value = (compressed, "")
+    session = _session(
+        agent=agent,
+        history=[
+            {"role": "user", "content": "one"},
+            {"role": "assistant", "content": "two"},
+            {"role": "user", "content": "three"},
+            {"role": "assistant", "content": "four"},
+        ],
+    )
+
+    removed, _usage = server._compress_session_history(session)
+
+    assert removed == 3
+    assert session["history"] == compressed
+    agent._compress_context.assert_called_once()
+    assert agent._compress_context.call_args.kwargs.get("force") is True
+
+
 def test_session_compress_uses_compress_helper(monkeypatch):
     agent = types.SimpleNamespace()
     server._sessions["sid"] = _session(agent=agent)
