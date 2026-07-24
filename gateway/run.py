@@ -1942,6 +1942,7 @@ from gateway.config import (
     HomeChannel,
     PlatformConfig,
     load_gateway_config,
+    persist_home_channel,
 )
 from gateway.session import (
     AsyncSessionStore,
@@ -1961,6 +1962,24 @@ from gateway.delivery import (
     resolve_delivery_transport,
 )
 from gateway.turn_lease import SessionTurnLeaseRegistry
+
+
+def _should_auto_adopt_home(source: Any, relay_adapter: Any, config: GatewayConfig) -> bool:
+    """Allow auto-home only for configured, authenticated Relay DMs."""
+    platform = getattr(source, "platform", None)
+    fronts_platform = getattr(relay_adapter, "fronts_platform", None)
+    return bool(
+        getattr(config, "auto_home", False)
+        and getattr(source, "delivered_via_upstream_relay", False) is True
+        and getattr(source, "chat_type", None) == "dm"
+        and getattr(source, "chat_id", None)
+        and getattr(source, "user_id", None)
+        and platform not in {None, Platform.LOCAL, Platform.RELAY}
+        and callable(fronts_platform)
+        and fronts_platform(platform)
+    )
+
+
 from gateway.authz_mixin import GatewayAuthorizationMixin
 from gateway.kanban_watchers import GatewayKanbanWatchersMixin
 from gateway.slash_commands import GatewaySlashCommandsMixin
@@ -3157,6 +3176,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         except Exception:
             logger.debug("could not set multiplex-active flag", exc_info=True)
         self.adapters: Dict[Platform, BasePlatformAdapter] = {}
+        self._auto_home_locks: Dict[tuple[str, Platform], asyncio.Lock] = {}
         # Multi-profile multiplexing: adapters for NON-default profiles live
         # here, keyed by profile name then Platform. self.adapters stays the
         # default/active profile's map so the ~93 existing self.adapters[...]
@@ -10109,11 +10129,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
 
 
-    async def _deliver_platform_notice(self, source, content: str) -> None:
-        """Deliver a setup/operational notice using platform-specific privacy rules."""
+    async def _deliver_platform_notice(self, source, content: str) -> bool:
+        """Deliver a setup/operational notice and report confirmed success."""
         adapter = self._adapter_for_source(source)
         if not adapter:
-            return
+            return False
 
         config = getattr(self, "config", None)
         notice_delivery = "public"
@@ -10130,7 +10150,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     metadata=metadata,
                 )
                 if getattr(result, "success", False):
-                    return
+                    return True
             except Exception:
                 logger.debug(
                     "[%s] send_private_notice failed, falling back to public",
@@ -10138,7 +10158,80 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     exc_info=True,
                 )
 
-        await adapter.send(source.chat_id, content, metadata=metadata)
+        result = await adapter.send(source.chat_id, content, metadata=metadata)
+        return bool(getattr(result, "success", False))
+
+    async def _maybe_auto_adopt_home(self, source) -> bool:
+        """Atomically adopt one authenticated Relay DM as a logical home."""
+        relay_adapter = self._adapter_for_source(source)
+        if not _should_auto_adopt_home(source, relay_adapter, self.config):
+            return False
+
+        profile = (getattr(source, "profile", None) or "default").strip() or "default"
+        lock_key = (profile, source.platform)
+        locks = getattr(self, "_auto_home_locks", None)
+        if locks is None:
+            locks = {}
+            self._auto_home_locks = locks
+        lock = locks.setdefault(lock_key, asyncio.Lock())
+
+        async with lock:
+            if self.config.get_home_channel(source.platform):
+                return False
+
+            confirmation = (
+                "📬 This direct message will become your home channel. "
+                "Hermes will deliver cron results and cross-platform messages "
+                "here. Run /sethome elsewhere to change it."
+            )
+            try:
+                confirmed = await self._deliver_platform_notice(source, confirmation)
+            except Exception:
+                logger.warning(
+                    "Auto-home confirmation raised for %s:%s; home not persisted",
+                    source.platform.value,
+                    source.chat_id,
+                    exc_info=True,
+                )
+                return False
+            if not confirmed:
+                logger.warning(
+                    "Auto-home confirmation failed for %s:%s; home not persisted",
+                    source.platform.value,
+                    source.chat_id,
+                )
+                return False
+
+            chat_id = str(source.chat_id)
+            home = HomeChannel(
+                platform=source.platform,
+                chat_id=chat_id,
+                name=source.chat_name or chat_id,
+                thread_id=None,
+                user_id=str(source.user_id),
+                scope_id=(
+                    str(source.scope_id)
+                    if getattr(source, "scope_id", None)
+                    else None
+                ),
+            )
+            try:
+                persist_home_channel(home)
+            except Exception:
+                logger.warning("Auto-home persistence failed", exc_info=True)
+                return False
+
+            platform_config = self.config.platforms.setdefault(
+                source.platform,
+                PlatformConfig(enabled=False),
+            )
+            platform_config.home_channel = home
+            logger.info(
+                "Auto-adopted trusted relay %s DM %s as home channel",
+                source.platform.value,
+                chat_id,
+            )
+            return True
 
     async def _resolve_async_delegation_session(
         self,
@@ -13181,22 +13274,24 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 except Exception:
                     pass
             if not home_env:
-                # Slack dispatches all Hermes commands through a single
-                # parent slash command `/hermes`; bare `/sethome` is not
-                # registered and would fail with "app did not respond".
-                sethome_cmd = (
-                    "/hermes sethome"
-                    if source.platform == Platform.SLACK
-                    else "/sethome"
-                )
-                notice = (
-                    f"📬 No home channel is set for {platform_name.title()}. "
-                    f"A home channel is where Hermes delivers cron job results "
-                    f"and cross-platform messages.\n\n"
-                    f"Type {sethome_cmd} to make this chat your home channel, "
-                    f"or ignore to skip."
-                )
-                await self._deliver_platform_notice(source, notice)
+                adopted = await self._maybe_auto_adopt_home(source)
+                if not adopted:
+                    # Slack dispatches all Hermes commands through a single
+                    # parent slash command `/hermes`; bare `/sethome` is not
+                    # registered and would fail with "app did not respond".
+                    sethome_cmd = (
+                        "/hermes sethome"
+                        if source.platform == Platform.SLACK
+                        else "/sethome"
+                    )
+                    notice = (
+                        f"📬 No home channel is set for {platform_name.title()}. "
+                        f"A home channel is where Hermes delivers cron job results "
+                        f"and cross-platform messages.\n\n"
+                        f"Type {sethome_cmd} to make this chat your home channel, "
+                        f"or ignore to skip."
+                    )
+                    await self._deliver_platform_notice(source, notice)
         
         # -----------------------------------------------------------------
         # Voice channel awareness — deliver current voice channel state so

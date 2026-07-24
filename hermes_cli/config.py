@@ -2980,6 +2980,11 @@ DEFAULT_CONFIG = {
     # Gateway settings — control how messaging platforms (Telegram, Discord,
     # Slack, etc.) deliver agent-produced files as native attachments.
     "gateway": {
+        # Adopt the first authenticated Relay-delivered direct message as the
+        # logical platform home instead of prompting for /sethome. Off by
+        # default so users explicitly choose a home unless they opt in.
+        "auto_home": False,
+
         # Durable delivery-obligation ledger: final agent responses are
         # recorded in state.db around the platform send, and a gateway that
         # died between finalize and platform ACK redelivers the stored

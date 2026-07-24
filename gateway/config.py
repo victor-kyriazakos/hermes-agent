@@ -881,6 +881,10 @@ class GatewayConfig:
     # tooling and downgrade safety; set gateway.write_sessions_json: false in
     # config.yaml to stop producing the file.
     write_sessions_json: bool = True
+
+    # Adopt the first authenticated Relay DM as the logical platform home.
+    # User-facing configuration is gateway.auto_home in config.yaml.
+    auto_home: bool = False
     
     # Delivery settings
     always_log_local: bool = True  # Always save cron outputs to local files
@@ -1037,6 +1041,7 @@ class GatewayConfig:
             "quick_commands": self.quick_commands,
             "sessions_dir": str(self.sessions_dir),
             "write_sessions_json": self.write_sessions_json,
+            "auto_home": self.auto_home,
             "always_log_local": self.always_log_local,
             "filter_silence_narration": self.filter_silence_narration,
             "stt_enabled": self.stt_enabled,
@@ -1167,6 +1172,7 @@ class GatewayConfig:
             quick_commands=quick_commands,
             sessions_dir=sessions_dir,
             write_sessions_json=_coerce_bool(data.get("write_sessions_json"), True),
+            auto_home=_coerce_bool(data.get("auto_home"), False),
             always_log_local=_coerce_bool(data.get("always_log_local"), True),
             filter_silence_narration=_coerce_bool(
                 data.get("filter_silence_narration"), True
@@ -1365,6 +1371,9 @@ def load_gateway_config() -> GatewayConfig:
                 gw_data["write_sessions_json"] = yaml_cfg["write_sessions_json"]
             elif isinstance(gateway_section, dict) and "write_sessions_json" in gateway_section:
                 gw_data["write_sessions_json"] = gateway_section["write_sessions_json"]
+
+            if isinstance(gateway_section, dict) and "auto_home" in gateway_section:
+                gw_data["auto_home"] = gateway_section["auto_home"]
 
             if "filter_silence_narration" in yaml_cfg:
                 gw_data["filter_silence_narration"] = yaml_cfg[
