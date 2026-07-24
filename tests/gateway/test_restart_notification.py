@@ -855,6 +855,70 @@ async def test_shutdown_notifications_are_fully_muted_when_flag_disabled():
 
 
 @pytest.mark.asyncio
+async def test_relay_fronted_home_gets_shutdown_notification_with_persisted_owner():
+    runner, _native = make_restart_runner()
+    relay = MagicMock()
+    relay.fronts_platform.side_effect = lambda platform: platform == Platform.SLACK
+    relay.send_for_platform = AsyncMock(
+        return_value=SendResult(success=True, message_id="shutdown")
+    )
+    runner.adapters = {Platform.RELAY: relay}
+    runner.config.platforms = {
+        Platform.RELAY: PlatformConfig(enabled=True),
+        Platform.SLACK: PlatformConfig(
+            enabled=False,
+            home_channel=HomeChannel(
+                platform=Platform.SLACK,
+                chat_id="D123",
+                name="Owner DM",
+                user_id="U123",
+                scope_id="T123",
+            ),
+        ),
+    }
+
+    await runner._notify_active_sessions_of_shutdown()
+
+    relay.send_for_platform.assert_awaited_once()
+    call = relay.send_for_platform.await_args
+    assert call.args[:2] == (Platform.SLACK, "D123")
+    assert "Gateway shutting down" in call.args[2]
+    assert call.kwargs["metadata"]["user_id"] == "U123"
+    assert call.kwargs["metadata"]["scope_id"] == "T123"
+
+
+@pytest.mark.asyncio
+async def test_relay_fronted_active_session_shutdown_uses_source_provenance():
+    runner, _native = make_restart_runner()
+    relay = MagicMock()
+    relay.fronts_platform.side_effect = lambda platform: platform == Platform.SLACK
+    relay.send_for_platform = AsyncMock(
+        return_value=SendResult(success=True, message_id="shutdown")
+    )
+    runner.adapters = {Platform.RELAY: relay}
+    runner.config.platforms = {
+        Platform.RELAY: PlatformConfig(enabled=True),
+        Platform.SLACK: PlatformConfig(enabled=False),
+    }
+    source = make_restart_source(chat_id="D-active")
+    source.platform = Platform.SLACK
+    source.user_id = "U-active"
+    source.scope_id = "T-active"
+    source.delivered_via_upstream_relay = True
+    session_key = build_session_key(source)
+    runner._running_agents[session_key] = object()
+    runner.session_store._entries[session_key] = MagicMock(origin=source)
+
+    await runner._notify_active_sessions_of_shutdown()
+
+    relay.send_for_platform.assert_awaited_once()
+    call = relay.send_for_platform.await_args
+    assert call.args[:2] == (Platform.SLACK, "D-active")
+    assert call.kwargs["metadata"]["user_id"] == "U-active"
+    assert call.kwargs["metadata"]["scope_id"] == "T-active"
+
+
+@pytest.mark.asyncio
 async def test_restart_shutdown_notification_anchors_telegram_dm_topic():
     runner, adapter = make_restart_runner()
     runner._restart_requested = True

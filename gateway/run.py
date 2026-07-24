@@ -6618,8 +6618,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
             try:
                 platform = Platform(platform_str)
-                adapter = self.adapters.get(platform)
-                if not adapter:
+                transport = resolve_delivery_transport(platform, self.config, self.adapters)
+                if transport is None:
                     continue
 
                 platform_cfg = self.config.platforms.get(platform)
@@ -6647,10 +6647,21 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     thread_id,
                     chat_type=getattr(source, "chat_type", None) if source is not None else None,
                     reply_to_message_id=reply_to_message_id,
-                    adapter=adapter,
+                    adapter=transport.adapter,
                 )
+                if transport.is_relay and source is not None:
+                    metadata = dict(metadata or {})
+                    if source.user_id:
+                        metadata["user_id"] = source.user_id
+                    if source.scope_id:
+                        metadata["scope_id"] = source.scope_id
 
-                result = await adapter.send(chat_id, msg, metadata=metadata)
+                result = await transport.send(
+                    platform,
+                    chat_id,
+                    msg,
+                    metadata=_non_conversational_metadata(metadata, platform=platform),
+                )
                 if result is not None and getattr(result, "success", True) is False:
                     logger.debug(
                         "Failed to send shutdown notification to %s:%s: %s",
@@ -6701,18 +6712,19 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # fail toward the louder, more-visible behaviour.
             logger.debug("drain_notification_suppressed check failed: %s", e)
 
-        # Snapshot adapters up front: adapter.send() can hit a fatal error
-        # path that pops the adapter from self.adapters (see _handle_fatal
-        # elsewhere), which would otherwise trigger
-        # ``RuntimeError: dictionary changed size during iteration`` —
-        # observed in a user report during gateway shutdown.
-        for platform, adapter in list(self.adapters.items()):
-            home = self.config.get_home_channel(platform)
+        # Iterate logical platform config, not transport adapter keys: a Relay
+        # adapter is registered as ``relay`` while the durable home remains the
+        # user-facing platform (for example ``slack``).
+        for platform, platform_cfg in list(self.config.platforms.items()):
+            home = platform_cfg.home_channel
             if not home or not home.chat_id:
                 continue
 
-            platform_cfg = self.config.platforms.get(platform)
-            if platform_cfg is not None and not platform_cfg.gateway_restart_notification:
+            transport = resolve_delivery_transport(platform, self.config, self.adapters)
+            if transport is None:
+                continue
+
+            if not platform_cfg.gateway_restart_notification:
                 logger.info(
                     "Shutdown notification suppressed for home channel: %s has gateway_restart_notification=false",
                     platform.value,
@@ -6728,12 +6740,20 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     platform,
                     home.chat_id,
                     home.thread_id,
-                    adapter=adapter,
+                    adapter=transport.adapter,
                 )
-                if metadata:
-                    result = await adapter.send(str(home.chat_id), msg, metadata=metadata)
-                else:
-                    result = await adapter.send(str(home.chat_id), msg)
+                if transport.is_relay:
+                    metadata = dict(metadata or {})
+                    if home.user_id:
+                        metadata["user_id"] = home.user_id
+                    if home.scope_id:
+                        metadata["scope_id"] = home.scope_id
+                result = await transport.send(
+                    platform,
+                    str(home.chat_id),
+                    msg,
+                    metadata=_non_conversational_metadata(metadata, platform=platform),
+                )
                 if result is not None and getattr(result, "success", True) is False:
                     logger.debug(
                         "Failed to send shutdown notification to home channel %s:%s: %s",
