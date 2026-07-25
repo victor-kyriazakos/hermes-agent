@@ -20,6 +20,8 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import uuid
+from collections import OrderedDict
 from typing import Any, Callable, Dict, Optional
 
 from gateway.config import Platform, PlatformConfig
@@ -95,6 +97,21 @@ class RelayAdapter(BasePlatformAdapter):
         # None when either is absent (media lanes then degrade to the
         # pre-media text fallbacks).
         self._media_client: Optional["RelayMediaClient"] = None
+        # Native interactive prompt state (Slack Block Kit over the relay).
+        # The connector renders ``metadata.blocks`` as native Block Kit and
+        # relays the resulting block_actions click back inbound as a
+        # MessageEvent whose ``text`` is the button ``value`` we encoded here
+        # (``cl:<clarify_id>:<idx|other>`` / ``ap:<approval_id>:approve|deny``).
+        # We remember which session each prompt belongs to so the inbound tap
+        # resolves the right waiting agent thread. Bounded so a long-lived
+        # gateway can't grow these without limit. Mirrors WhatsApp Cloud's
+        # ``_clarify_state`` / ``_exec_approval_state``.
+        #   _clarify_state:       clarify_id  → session_key
+        #                         (resolve via tools.clarify_gateway)
+        #   _exec_approval_state: approval_id → session_key
+        #                         (resolve via tools.approval.resolve_gateway_approval)
+        self._clarify_state: "OrderedDict[str, str]" = OrderedDict()
+        self._exec_approval_state: "OrderedDict[str, str]" = OrderedDict()
 
     # ── capability surface (from descriptor) ─────────────────────────────
     @property
@@ -235,6 +252,16 @@ class RelayAdapter(BasePlatformAdapter):
     async def _on_inbound(self, event) -> None:
         """Bridge a connector-delivered MessageEvent into the normal adapter path."""
         self._capture_scope(event)
+        # A relayed Slack block_action tap arrives as a MessageEvent whose text
+        # is the button value we encoded (cl:/ap: prefixes). Claim it here so it
+        # resolves the waiting clarify/approval instead of being dispatched as a
+        # fresh conversation turn. A miss (stale tap, unknown prefix) returns
+        # False and falls through to the normal path.
+        try:
+            if self._maybe_resolve_interaction(event):
+                return
+        except Exception:  # noqa: BLE001 - interaction dispatch must never break inbound
+            logger.debug("relay interaction dispatch failed", exc_info=True)
         await self._localize_inbound_media(event)
         await self.handle_message(event)
 
@@ -333,7 +360,9 @@ class RelayAdapter(BasePlatformAdapter):
         except Exception:  # noqa: BLE001 - scope tracking must never break inbound
             pass
 
-    def _with_scope(self, chat_id: str, metadata: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    def _with_scope(
+        self, chat_id: str, metadata: Optional[Dict[str, Any]]
+    ) -> Dict[str, Any]:
         """Ensure the outbound metadata carries the discriminator(s) the connector's
         egress guard needs to resolve the owning tenant.
 
@@ -487,16 +516,26 @@ class RelayAdapter(BasePlatformAdapter):
         else:
             text = ""
         member = payload.get("member") or {}
-        user = (member.get("user") if isinstance(member, dict) else None) or payload.get("user") or {}
+        user = (
+            (member.get("user") if isinstance(member, dict) else None)
+            or payload.get("user")
+            or {}
+        )
         channel_id = str(payload.get("channel_id") or "")
         guild_id = payload.get("guild_id")  # real Discord interaction wire field
         source = SessionSource(
             platform=Platform.RELAY,
             chat_id=channel_id,
             chat_type="channel" if guild_id else "dm",
-            user_id=str(user.get("id")) if isinstance(user, dict) and user.get("id") else None,
-            user_name=str(user.get("username")) if isinstance(user, dict) and user.get("username") else None,
-            scope_id=str(guild_id) if guild_id else None,  # Discord guild → generic scope slot
+            user_id=str(user.get("id"))
+            if isinstance(user, dict) and user.get("id")
+            else None,
+            user_name=str(user.get("username"))
+            if isinstance(user, dict) and user.get("username")
+            else None,
+            scope_id=str(guild_id)
+            if guild_id
+            else None,  # Discord guild → generic scope slot
             message_id=str(payload.get("id")) if payload.get("id") else None,
         )
         return MessageEvent(text=text, message_type=message_type, source=source)
@@ -523,7 +562,9 @@ class RelayAdapter(BasePlatformAdapter):
                 sub_name = str(opt.get("name") or "").strip()
                 if sub_name:
                     parts.append(sub_name)
-                parts.extend(RelayAdapter._render_interaction_options(opt.get("options")))
+                parts.extend(
+                    RelayAdapter._render_interaction_options(opt.get("options"))
+                )
             else:
                 value = opt.get("value")
                 if value is not None and str(value).strip():
@@ -662,6 +703,351 @@ class RelayAdapter(BasePlatformAdapter):
             message_id=result.get("message_id"),
             error=result.get("error"),
         )
+
+    # ── native interactive prompts (Slack Block Kit over the relay) ──────
+    #
+    # The connector renders ``metadata.blocks`` (a list of Slack Block Kit
+    # block dicts) as native interactive UI ONLY for Slack — its slackRestSender
+    # does ``const blocks = action.metadata?.blocks; if (blocks) body.blocks =
+    # blocks`` and falls back to the ``content`` text otherwise. So we only emit
+    # blocks when the chat is fronted by Slack; every other relay-fronted
+    # platform (and Slack when we can't tell) falls through to the base
+    # numbered-text rendering, which the connector delivers as plain text. The
+    # numbered text is ALWAYS kept as the message ``content`` too — it's the
+    # notification preview, the accessibility fallback, and what a connector
+    # that ignores ``metadata.blocks`` shows.
+
+    _INTERACTIVE_STATE_CACHE_SIZE = 512
+
+    @staticmethod
+    def _bounded_put(cache: "OrderedDict[str, str]", key: str, value: str) -> None:
+        """Insert into a FIFO-capped OrderedDict, evicting oldest entries."""
+        cache[key] = value
+        while len(cache) > RelayAdapter._INTERACTIVE_STATE_CACHE_SIZE:
+            cache.popitem(last=False)
+
+    def _chat_is_slack(self, chat_id: str) -> bool:
+        """Whether this chat egresses through Slack.
+
+        One relay adapter fronts N platforms on one socket; Block Kit is a
+        Slack-only wire shape, so only stamp ``metadata.blocks`` when we know
+        the chat lives on Slack. ``_platform_by_chat`` is learned from the
+        inbound event that triggered this turn (``_capture_scope``); a clarify
+        or approval is always emitted mid-turn in reply to such an event, so it
+        is populated on the live path. Unknown (scheduled/persisted-home sends
+        with no fresh inbound) falls back to text — never a regression.
+        """
+        return self._platform_by_chat.get(str(chat_id)) == Platform.SLACK.value
+
+    async def send_clarify(
+        self,
+        chat_id: str,
+        question: str,
+        choices: Optional[list],
+        clarify_id: str,
+        session_key: str,
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> SendResult:
+        """Render a clarify prompt as native Slack Block Kit over the relay.
+
+        Multi-choice → a section block with the question plus an actions block
+        carrying one button per choice (``value`` packs ``cl:<clarify_id>:<idx>``)
+        and a final "✏️ Other" button (``cl:<clarify_id>:other``). A choice tap
+        resolves the clarify directly; "Other" flips the entry into text-capture
+        so the gateway's platform-agnostic text-intercept picks up the next
+        typed message. The numbered text is retained as the message content
+        (notification/accessibility/connector text fallback).
+
+        Open-ended (no choices) → no blocks; delegates to the base
+        implementation, which renders the plain question and arms the same
+        text-intercept.
+
+        Non-Slack relay chats delegate to the base numbered-text fallback.
+        """
+        # Open-ended, or a non-Slack relay chat, or no choices: the base
+        # implementation renders the right text and arms the gateway
+        # text-intercept. No Block Kit for these.
+        if not choices or not self._chat_is_slack(chat_id):
+            return await super().send_clarify(
+                chat_id=chat_id,
+                question=question,
+                choices=choices,
+                clarify_id=clarify_id,
+                session_key=session_key,
+                metadata=metadata,
+            )
+
+        question = (question or "").strip()
+        choices_list = [str(c).strip() for c in choices if str(c).strip()]
+
+        # Numbered text (always sent as content): notification preview,
+        # accessibility fallback, and what a connector ignoring metadata.blocks
+        # renders. Mirrors the base default's wording so behaviour is identical
+        # when blocks are dropped.
+        lines = [f"❓ {question}", ""]
+        for i, choice in enumerate(choices_list, start=1):
+            lines.append(f"  {i}. {choice}")
+        lines.append("")
+        lines.append("Reply with the number, the option text, or your own answer.")
+        text = "\n".join(lines)
+
+        # Escape Slack mrkdwn control chars so a question containing them
+        # renders literally instead of as markup/mentions.
+        q = question.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+        body = f"❓ {q}"
+        # Slack section text caps at 3000 chars; budget defensively.
+        if len(body) > 2997:
+            body = body[:2997] + "..."
+
+        elements = []
+        for idx, choice_text in enumerate(choices_list):
+            label = choice_text or f"Option {idx + 1}"
+            elements.append({
+                "type": "button",
+                "text": {"type": "plain_text", "text": label[:75], "emoji": True},
+                "value": f"cl:{clarify_id}:{idx}",
+            })
+        elements.append({
+            "type": "button",
+            "text": {"type": "plain_text", "text": "✏️ Other", "emoji": True},
+            "value": f"cl:{clarify_id}:other",
+        })
+
+        blocks: list = [
+            {"type": "section", "text": {"type": "mrkdwn", "text": body}},
+        ]
+        # Slack caps an actions block at 5 elements; the clarify tool caps
+        # choices at 4 (+Other = 5) so this is normally one block, but chunk
+        # anyway so a larger list degrades gracefully instead of erroring.
+        for start in range(0, len(elements), 5):
+            blocks.append({"type": "actions", "elements": elements[start : start + 5]})
+
+        send_metadata: Dict[str, Any] = dict(metadata or {})
+        send_metadata["blocks"] = blocks
+
+        result = await self.send(chat_id, text, metadata=send_metadata)
+        if result.success:
+            self._bounded_put(self._clarify_state, clarify_id, session_key)
+        return result
+
+    async def send_exec_approval(
+        self,
+        chat_id: str,
+        command: str,
+        session_key: str,
+        description: str = "dangerous command",
+        metadata: Optional[Dict[str, Any]] = None,
+        allow_permanent: bool = True,
+        allow_session: bool = True,
+        smart_denied: bool = False,
+    ) -> SendResult:
+        """Render a dangerous-command approval prompt as native Slack Block Kit.
+
+        A section block with the command (in a mrkdwn code block) + reason, then
+        an actions block with two buttons: Approve (primary,
+        ``ap:<approval_id>:approve``) and Deny (danger,
+        ``ap:<approval_id>:deny``). Tapping resolves the waiting agent via
+        ``tools.approval.resolve_gateway_approval`` — the same mechanism as the
+        text ``/approve`` flow. The plain-text prompt is kept as the message
+        content (notification/accessibility/connector text fallback).
+
+        Non-Slack relay chats fall through to the base text path (the gateway's
+        ``_approval_notify_sync`` fallback), so this adapter only overrides for
+        the Slack lane it can render natively.
+        """
+        # This relay lane offers a one-shot Approve / Deny; the finer-grained
+        # session/permanent scopes are only surfaced by the native Bolt adapter.
+        del allow_permanent, allow_session
+
+        approval_id = uuid.uuid4().hex[:12]
+
+        cmd = command or ""
+        cmd_preview = cmd if len(cmd) <= 2500 else cmd[:2500] + "..."
+        header = "⚠️ *Command Approval Required*"
+        if smart_denied:
+            header += (
+                "\n*Smart DENY:* owner override applies to this one operation only."
+            )
+        reason = f"Reason: {description}"
+
+        # Plain-text fallback (always sent as content).
+        text = f"{header}\n```\n{cmd_preview}\n```\n{reason}"
+
+        if not self._chat_is_slack(chat_id):
+            # No native rendering for non-Slack relay chats. Do NOT store state
+            # (there is no inbound block_action to resolve it) — the gateway's
+            # text-approval fallback handles these.
+            return await self.send(chat_id, text, metadata=metadata)
+
+        blocks = [
+            {
+                "type": "section",
+                "text": {
+                    "type": "mrkdwn",
+                    "text": f"{header}\n```{cmd_preview}```\n{reason}",
+                },
+            },
+            {
+                "type": "actions",
+                "elements": [
+                    {
+                        "type": "button",
+                        "text": {"type": "plain_text", "text": "Approve"},
+                        "style": "primary",
+                        "value": f"ap:{approval_id}:approve",
+                    },
+                    {
+                        "type": "button",
+                        "text": {"type": "plain_text", "text": "Deny"},
+                        "style": "danger",
+                        "value": f"ap:{approval_id}:deny",
+                    },
+                ],
+            },
+        ]
+
+        send_metadata: Dict[str, Any] = dict(metadata or {})
+        send_metadata["blocks"] = blocks
+
+        result = await self.send(chat_id, text, metadata=send_metadata)
+        if result.success:
+            self._bounded_put(self._exec_approval_state, approval_id, session_key)
+        return result
+
+    def _maybe_resolve_interaction(self, event) -> bool:
+        """Resolve a relayed Slack block_action tap; return True if claimed.
+
+        The connector renders ``metadata.blocks`` as native Block Kit and, when
+        the user clicks a button, relays the interaction back inbound as an
+        ordinary ``MessageEvent`` whose ``text`` is the button ``value`` we
+        encoded (``cl:<clarify_id>:<idx|other>`` / ``ap:<approval_id>:approve|
+        deny``). This mirrors the connector's existing Discord component lane
+        (``_discord_interaction_to_event`` sets ``text = custom_id``).
+
+        Dispatch table:
+          ``cl:<clarify_id>:<idx|other>``  → resolve_gateway_clarify /
+                                             mark_awaiting_text
+          ``ap:<approval_id>:approve|deny`` → resolve_gateway_approval
+
+        Returns True when the tap was claimed (the caller must NOT dispatch it
+        as a fresh conversation turn). Returns False for any non-interaction
+        text, an unrecognized/malformed value, or missing state (stale tap,
+        cross-restart) — the caller then falls back to normal text dispatch, so
+        a stale tap surfaces as a plain message rather than being swallowed.
+        """
+        value = (getattr(event, "text", "") or "").strip()
+        if not value:
+            return False
+
+        if value.startswith("cl:"):
+            parts = value.split(":", 2)
+            if len(parts) != 3:
+                return False
+            _, clarify_id, choice = parts
+            session_key = self._clarify_state.pop(clarify_id, None)
+            if not session_key:
+                logger.info(
+                    "[relay] clarify tap with no matching state "
+                    "(clarify_id=%s) — likely stale; falling back to text",
+                    clarify_id,
+                )
+                return False
+            try:
+                from tools.clarify_gateway import (
+                    mark_awaiting_text,
+                    resolve_gateway_clarify,
+                )
+            except ImportError:
+                logger.warning(
+                    "[relay] clarify resolver unavailable; falling back to text"
+                )
+                return False
+            if choice == "other":
+                # User wants to type a free-form answer: flip into text-capture
+                # so the gateway's platform-agnostic text-intercept resolves the
+                # clarify from their next message.
+                flipped = False
+                try:
+                    flipped = mark_awaiting_text(clarify_id)
+                except Exception:
+                    logger.exception(
+                        "[relay] mark_awaiting_text failed for %s", clarify_id
+                    )
+                if not flipped:
+                    logger.info(
+                        "[relay] clarify 'Other' tap but entry missing "
+                        "(clarify_id=%s); falling back to text",
+                        clarify_id,
+                    )
+                    return False
+                # Keep the mapping live for any future tap on the same prompt.
+                self._clarify_state[clarify_id] = session_key
+                return True
+            try:
+                idx = int(choice)
+            except ValueError:
+                logger.warning("[relay] clarify tap had non-int choice: %r", choice)
+                self._clarify_state[clarify_id] = session_key
+                return False
+            # Resolve with the canonical choice text (mirrors the native Slack
+            # and Telegram adapters) so the agent sees the human-readable answer
+            # rather than a bare index. Fall back to a positional label on a
+            # race with timeout / session reset.
+            resolved_text: Optional[str] = None
+            try:
+                from tools import clarify_gateway as _clarify_mod
+
+                entry = _clarify_mod._entries.get(clarify_id)  # type: ignore[attr-defined]
+                if entry and entry.choices and 0 <= idx < len(entry.choices):
+                    resolved_text = str(entry.choices[idx])
+            except Exception:
+                resolved_text = None
+            if resolved_text is None:
+                resolved_text = f"choice {idx + 1}"
+            resolved = resolve_gateway_clarify(clarify_id, resolved_text)
+            if not resolved:
+                logger.info(
+                    "[relay] clarify resolver reported no waiter "
+                    "(clarify_id=%s) — falling back to text",
+                    clarify_id,
+                )
+                return False
+            return True
+
+        if value.startswith("ap:"):
+            parts = value.split(":", 2)
+            if len(parts) != 3:
+                return False
+            _, approval_id, choice = parts
+            session_key = self._exec_approval_state.pop(approval_id, None)
+            if not session_key:
+                logger.info(
+                    "[relay] approval tap with no matching state "
+                    "(approval_id=%s) — likely stale; falling back to text",
+                    approval_id,
+                )
+                return False
+            if choice not in ("approve", "deny"):
+                self._exec_approval_state[approval_id] = session_key
+                return False
+            try:
+                from tools.approval import resolve_gateway_approval
+            except ImportError:
+                logger.warning("[relay] approval resolver unavailable")
+                return False
+            count = resolve_gateway_approval(session_key, choice)
+            if not count:
+                logger.info(
+                    "[relay] approval resolver reported no waiter "
+                    "(session_key=%s) — likely already resolved",
+                    session_key,
+                )
+            # Claim regardless: a tap that lands after the wait timed out was
+            # already denied fail-closed, and re-dispatching the raw "ap:..."
+            # value as a chat turn would be nonsense.
+            return True
+
+        return False
 
     async def edit_message(
         self,
@@ -968,8 +1354,12 @@ class RelayAdapter(BasePlatformAdapter):
         if result is not None:
             return result
         return await super().send_image_file(
-            chat_id, image_path, caption=caption, reply_to=reply_to,
-            metadata=metadata, **kwargs,
+            chat_id,
+            image_path,
+            caption=caption,
+            reply_to=reply_to,
+            metadata=metadata,
+            **kwargs,
         )
 
     async def send_voice(
@@ -994,8 +1384,12 @@ class RelayAdapter(BasePlatformAdapter):
         if result is not None:
             return result
         return await super().send_voice(
-            chat_id, audio_path, caption=caption, reply_to=reply_to,
-            metadata=metadata, **kwargs,
+            chat_id,
+            audio_path,
+            caption=caption,
+            reply_to=reply_to,
+            metadata=metadata,
+            **kwargs,
         )
 
     async def send_video(
@@ -1020,8 +1414,12 @@ class RelayAdapter(BasePlatformAdapter):
         if result is not None:
             return result
         return await super().send_video(
-            chat_id, video_path, caption=caption, reply_to=reply_to,
-            metadata=metadata, **kwargs,
+            chat_id,
+            video_path,
+            caption=caption,
+            reply_to=reply_to,
+            metadata=metadata,
+            **kwargs,
         )
 
     async def send_document(
@@ -1048,6 +1446,11 @@ class RelayAdapter(BasePlatformAdapter):
         if result is not None:
             return result
         return await super().send_document(
-            chat_id, file_path, caption=caption, file_name=file_name,
-            reply_to=reply_to, metadata=metadata, **kwargs,
+            chat_id,
+            file_path,
+            caption=caption,
+            file_name=file_name,
+            reply_to=reply_to,
+            metadata=metadata,
+            **kwargs,
         )
