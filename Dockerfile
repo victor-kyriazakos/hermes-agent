@@ -398,7 +398,11 @@ ENV HERMES_LAZY_INSTALL_TARGET=/opt/data/lazy-packages
 # every other consumer.
 ENV PATH="/opt/hermes/bin:/opt/hermes/.venv/bin:/opt/data/.local/bin:${PATH}"
 RUN mkdir -p /opt/data
-VOLUME [ "/opt/data" ]
+# NOTE(staging): upstream declares `VOLUME ["/opt/data"]` here. Railway's
+# Metal builder rejects the Docker VOLUME directive outright ("use Railway
+# Volumes") — and the staging services already mount /opt/data as a Railway
+# Volume, so the directive is redundant on this deploy target. Staging-only
+# deviation from main; re-appears on every rebase, drop it again.
 
 # s6-overlay's /init is PID 1. It sets up the supervision tree, runs
 # /etc/cont-init.d/* (our stage2 hook), starts s6-rc services
