@@ -6,6 +6,24 @@ set -eu
 # exact Hermes relay build as a gateway after seeding non-secret model settings.
 home="${HERMES_HOME:-/opt/data}"
 export HERMES_HOME="$home"
+
+# ---------- FLEX STAGING SETUP (2026-07-27) ----------
+# Mirror of railway-direct-wrapper.sh: HOME + user-local PATH on the durable
+# volume, lazy installs re-enabled onto the volume, pip/uv/npm self-service.
+export HOME="$home"
+export PATH="/opt/hermes/bin:/opt/hermes/.venv/bin:$home/.local/bin:${PATH}"
+unset HERMES_DISABLE_LAZY_INSTALLS || true
+export HERMES_LAZY_INSTALL_TARGET="${HERMES_LAZY_INSTALL_TARGET:-$home/lazy-packages}"
+export PYTHONUSERBASE="$home/.local"
+export PIP_CACHE_DIR="$home/.cache/pip"
+export UV_CACHE_DIR="$home/.cache/uv"
+export npm_config_prefix="$home/.local"
+export npm_config_cache="$home/.cache/npm"
+mkdir -p "$home/.local/bin" "$home/.cache/pip" "$home/.cache/uv" "$home/.cache/npm" "$HERMES_LAZY_INSTALL_TARGET"
+chown -R hermes:hermes "$home/.local" "$home/.cache" "$HERMES_LAZY_INSTALL_TARGET" 2>/dev/null || true
+printf 'flex_env HOME=%s PATH_head=%s lazy_target=%s\n' "$HOME" "${PATH%%:*}" "$HERMES_LAZY_INSTALL_TARGET"
+# ---------- END FLEX ----------
+
 s6-setuidgid hermes sh -c 'command -v hermes >/dev/null'
 s6-setuidgid hermes /opt/hermes/.venv/bin/hermes --version >/dev/null
 s6-setuidgid hermes /opt/hermes/.venv/bin/python -m hermes_cli.main --help >/dev/null
