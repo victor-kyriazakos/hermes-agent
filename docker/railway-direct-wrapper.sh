@@ -44,23 +44,9 @@ printf 'flex_env HOME=%s PATH_head=%s lazy_target=%s\n' "$HOME" "${PATH%%:*}" "$
 #  2. Seed marker-managed dotfiles on the volume HOME so login/interactive
 #     shells rebuild the full flex env (PATH, caches, lazy target).
 ln -sf /opt/hermes/bin/hermes /usr/local/bin/hermes
-for rc in "$home/.profile" "$home/.bashrc"; do
-  if ! grep -q 'HERMES-FLEX-ENV' "$rc" 2>/dev/null; then
-    cat >> "$rc" <<EOFRC
-# >>> HERMES-FLEX-ENV (managed by railway wrapper — do not edit inside markers)
-export HERMES_HOME="/opt/data"
-export PATH="/opt/hermes/bin:/opt/hermes/.venv/bin:/opt/data/.local/bin:\$PATH"
-export HERMES_LAZY_INSTALL_TARGET="/opt/data/lazy-packages"
-export PYTHONUSERBASE="/opt/data/.local"
-export PIP_CACHE_DIR="/opt/data/.cache/pip"
-export UV_CACHE_DIR="/opt/data/.cache/uv"
-export npm_config_prefix="/opt/data/.local"
-export npm_config_cache="/opt/data/.cache/npm"
-# <<< HERMES-FLEX-ENV
-EOFRC
-  fi
-done
-chown hermes:hermes "$home/.profile" "$home/.bashrc" 2>/dev/null || true
+# Persistent dotfiles are controlled by the hermes user. Seed them only after
+# dropping privileges, and reject symlinks or non-regular files in the seeder.
+/command/s6-setuidgid hermes /opt/hermes/docker/seed_flex_dotfiles.sh
 printf 'flex_env2 symlink=%s dotfiles=seeded\n' "$(readlink /usr/local/bin/hermes)"
 # ---------- END FLEX ----------
 
@@ -77,6 +63,8 @@ printf '%s\n' 'hermes_runtime_cli_preflight=passed'
 /command/s6-setuidgid hermes /opt/hermes/.venv/bin/hermes config set streaming.transport auto
 /command/s6-setuidgid hermes /opt/hermes/.venv/bin/hermes config set display.platforms.slack.tool_progress all
 /command/s6-setuidgid hermes /opt/hermes/.venv/bin/hermes config set display.platforms.slack.tool_progress_grouping accumulate
+/command/s6-setuidgid hermes /opt/hermes/.venv/bin/hermes config set display.platforms.slack.live_status verb
+/command/s6-setuidgid hermes /opt/hermes/.venv/bin/hermes config set monitoring.gateway_health_export.resource_attributes.deployment.environment.name staging
 /command/s6-setuidgid hermes /opt/hermes/.venv/bin/hermes config set monitoring.gateway_health_export.enabled true
 /command/s6-setuidgid hermes /opt/hermes/.venv/bin/hermes config set monitoring.gateway_health_export.metrics_enabled true
 /command/s6-setuidgid hermes /opt/hermes/.venv/bin/hermes config set monitoring.gateway_health_export.diagnostic_events_enabled true
