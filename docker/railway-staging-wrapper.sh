@@ -49,7 +49,7 @@ s6-setuidgid hermes /opt/hermes/.venv/bin/hermes config set model.base_url https
 s6-setuidgid hermes /opt/hermes/.venv/bin/hermes config set model.api_mode codex_responses
 s6-setuidgid hermes /opt/hermes/.venv/bin/hermes config set agent.reasoning_effort medium
 s6-setuidgid hermes /opt/hermes/.venv/bin/hermes config set display.platforms.slack.live_status verb
-s6-setuidgid hermes /opt/hermes/.venv/bin/hermes config set monitoring.gateway_health_export.resource_attributes.deployment.environment.name staging
+s6-setuidgid hermes /opt/hermes/.venv/bin/python /opt/hermes/docker/ensure_monitoring_resource_attributes.py staging
 s6-setuidgid hermes /opt/hermes/.venv/bin/hermes config set monitoring.gateway_health_export.enabled true
 s6-setuidgid hermes /opt/hermes/.venv/bin/hermes config set monitoring.gateway_health_export.metrics_enabled true
 s6-setuidgid hermes /opt/hermes/.venv/bin/hermes config set monitoring.gateway_health_export.diagnostic_events_enabled true

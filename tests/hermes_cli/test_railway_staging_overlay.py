@@ -1,11 +1,15 @@
 import os
 from pathlib import Path
 import subprocess
+import sys
+
+import yaml
 
 
 ROOT = Path(__file__).resolve().parents[2]
 WRAPPERS = ("railway-staging-wrapper.sh", "railway-direct-wrapper.sh")
 SEEDER = ROOT / "docker" / "seed_flex_dotfiles.sh"
+RESOURCE_HELPER = ROOT / "docker" / "ensure_monitoring_resource_attributes.py"
 MARKER = "HERMES-FLEX-ENV"
 
 
@@ -81,14 +85,65 @@ def test_railway_wrappers_seed_dotfiles_after_privilege_drop() -> None:
         assert 'chown hermes:hermes "$home/.profile"' not in wrapper
 
 
-def test_railway_wrappers_stamp_staging_and_use_bounded_slack_status() -> None:
-    required = (
-        "monitoring.gateway_health_export.resource_attributes."
-        "deployment.environment.name staging",
-        "display.platforms.slack.live_status verb",
+def test_monitoring_resource_helper_writes_flat_semconv_key(
+    tmp_path: Path,
+) -> None:
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text(
+        yaml.safe_dump(
+            {
+                "monitoring": {
+                    "gateway_health_export": {
+                        "resource_attributes": {
+                            "deployment.environment.name": "production",
+                            "service.name": "hermes-gateway",
+                        }
+                    }
+                }
+            },
+            sort_keys=False,
+        )
+    )
+    env = os.environ.copy()
+    env["HERMES_HOME"] = str(tmp_path)
+
+    subprocess.run(
+        [sys.executable, str(RESOURCE_HELPER), "staging"],
+        cwd=ROOT,
+        env=env,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+
+    config = yaml.safe_load(config_path.read_text())
+    attrs = config["monitoring"]["gateway_health_export"]["resource_attributes"]
+    assert attrs == {
+        "deployment.environment.name": "staging",
+        "service.name": "hermes-gateway",
+    }
+    assert "deployment" not in attrs
+
+    from agent.monitoring.gateway_health_export import _runtime_resource_attributes
+
+    exported = _runtime_resource_attributes(config, telemetry_scope="gateway_health")
+    assert exported["deployment.environment.name"] == "staging"
+
+
+def test_railway_wrappers_stamp_staging_with_flat_key_helper_and_bound_status() -> None:
+    helper = (
+        "/opt/hermes/docker/ensure_monitoring_resource_attributes.py staging"
+    )
+    bad_nested_set = (
+        "config set monitoring.gateway_health_export.resource_attributes."
+        "deployment.environment.name staging"
     )
     for name in WRAPPERS:
         wrapper = (ROOT / "docker" / name).read_text()
 
-        for setting in required:
-            assert setting in wrapper
+        assert helper in wrapper
+        assert bad_nested_set not in wrapper
+        assert "display.platforms.slack.live_status verb" in wrapper
+        assert wrapper.index(helper) < wrapper.index(
+            "monitoring.gateway_health_export.enabled true"
+        )
