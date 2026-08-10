@@ -109,6 +109,14 @@ PYEOF
 )"
 relay_dir="$home/.nemo-relay"
 mkdir -p "$relay_dir"
+# nemo-relay 0.7.x requires observability config VERSION 3: the flat
+# [components.config.opentelemetry] block became a typed endpoints LIST
+# ([[...opentelemetry.endpoints]] with type="full"). The old version-2 shape
+# fails 0.7.2's validator (observability.unsupported_config_version +
+# legacy_opentelemetry_field errors) and the plugin logs it only at DEBUG —
+# spans/analytics silently stop (staging outage 2026-08-09, freeze bump
+# nemo-relay 0.6.x -> 0.7.1). Validated against 0.7.2's real
+# _validate_plugin_config: this shape returns zero diagnostics.
 cat > "$relay_dir/plugins.toml" <<EOFTOML
 version = 1
 
@@ -117,10 +125,13 @@ kind = "observability"
 enabled = true
 
 [components.config]
-version = 2
+version = 3
 
 [components.config.opentelemetry]
 enabled = true
+
+[[components.config.opentelemetry.endpoints]]
+type = "full"
 endpoint = "http://otel-collector.railway.internal:4318/v1/traces"
 transport = "http_binary"
 service_name = "hermes-gateway"
@@ -128,7 +139,7 @@ service_namespace = "nous-enterprise-staging"
 mark_projection = "inherit"
 mark_exclude_names = ["llm.chunk"]
 
-[components.config.opentelemetry.resource_attributes]
+[components.config.opentelemetry.endpoints.resource_attributes]
 "service.instance.id" = "$instance_hash"
 "telemetry.scope" = "relay_lifecycle"
 EOFTOML
