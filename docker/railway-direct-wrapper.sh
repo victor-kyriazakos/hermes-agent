@@ -145,6 +145,15 @@ fi
 # Boxes with HERMES_STAGING_TRAJECTORIES=1 (Carol) also write full ATOF
 # event streams + ATIF trajectories to the durable volume as the deep
 # audit evidence tier.
+# PROBE GUARD (2026-08-10, delegation-stall isolation): set
+# HERMES_STAGING_DISABLE_NEMO_RELAY=1 on a box to boot WITHOUT the relay
+# observability plugin (health/monitoring plane unaffected). Used to
+# falsify "plugin scope finalization wedges child run_conversation".
+# Remove the variable to restore normal telemetry on next deploy.
+if [ "${HERMES_STAGING_DISABLE_NEMO_RELAY:-0}" = "1" ]; then
+  /command/s6-setuidgid hermes /opt/hermes/.venv/bin/hermes plugins disable observability/nemo_relay || true
+  printf 'relay_telemetry DISABLED by HERMES_STAGING_DISABLE_NEMO_RELAY probe guard\n'
+else
 /command/s6-setuidgid hermes /opt/hermes/.venv/bin/hermes plugins enable observability/nemo_relay
 instance_hash="$(/command/s6-setuidgid hermes /opt/hermes/.venv/bin/python - <<'PYEOF'
 import hashlib
@@ -216,6 +225,7 @@ chown -R hermes:hermes "$relay_dir"
 export HERMES_NEMO_RELAY_PLUGINS_TOML="$relay_dir/plugins.toml"
 printf 'relay_telemetry plugins_toml=%s instance=%s trajectories=%s\n' \
   "$HERMES_NEMO_RELAY_PLUGINS_TOML" "$instance_hash" "${HERMES_STAGING_TRAJECTORIES:-0}"
+fi
 # ---------- END RELAY TELEMETRY ----------
 
 cd "$home"
