@@ -100,10 +100,25 @@ if [ -n "${OPENAI_API_KEY:-}" ]; then
     /opt/hermes/.venv/bin/python - <<'PYEOF'
 import os, sys
 from agent.credential_pool import load_pool
+from hermes_cli.auth import has_usable_secret
 try:
     pool = load_pool("openai-api")
-    if pool.has_credentials():
-        print("credential_pool openai-api: already seeded (%d entries)" % len(pool.entries()))
+    entries = pool.entries() if pool else []
+    # Diagnostic (no secrets): label/auth_type/usable per entry, so boot
+    # logs explain WHY seeding did or didn't run.
+    for e in entries:
+        d = e.to_dict() if hasattr(e, "to_dict") else {}
+        print("credential_pool openai-api entry: label=%s auth_type=%s usable=%s exhausted=%s" % (
+            d.get("label"), d.get("auth_type"),
+            has_usable_secret(d.get("api_key")), bool(d.get("exhausted_at"))))
+    # Idempotence keyed on a USABLE api-key entry, not mere entry count —
+    # an OAuth remnant or exhausted row must not suppress seeding.
+    def _usable(e):
+        d = e.to_dict() if hasattr(e, "to_dict") else {}
+        return d.get("auth_type", "api_key") == "api_key" and \
+            has_usable_secret(d.get("api_key")) and not d.get("exhausted_at")
+    if any(_usable(e) for e in entries):
+        print("credential_pool openai-api: usable api-key entry present — no seeding needed")
         sys.exit(0)
     from hermes_cli import auth_commands
     class _A:  # argparse shim
