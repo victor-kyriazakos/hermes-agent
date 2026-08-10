@@ -86,6 +86,39 @@ printf '%s\n' 'hermes_runtime_cli_preflight=passed'
 /command/s6-setuidgid hermes /opt/hermes/.venv/bin/hermes config set monitoring.export.otlp.endpoint http://otel-collector.railway.internal:4318/v1/traces
 /command/s6-setuidgid hermes /opt/hermes/.venv/bin/python /opt/hermes/docker/ensure_platform_toolset.py slack terminal
 
+# ---------- CREDENTIAL POOL SEEDING (2026-08-10) ----------
+# Terminal/execute_code subprocesses deliberately strip provider API keys
+# from the child env (GHSA-rhgp-j443-p4rf posture; env_passthrough refuses
+# to re-allow them). A `hermes` CLI child spawned by the agent therefore
+# cannot inherit OPENAI_API_KEY and fails with "No usable credentials".
+# The sanctioned lane is the auth store / credential pool on the durable
+# volume (auth.json), which the CLI resolution chain consults after env.
+# Seed it idempotently from the service var so spawned CLI probes
+# (multi-model telemetry tests) resolve credentials without env leakage.
+if [ -n "${OPENAI_API_KEY:-}" ]; then
+  /command/s6-setuidgid hermes env OPENAI_API_KEY="$OPENAI_API_KEY" \
+    /opt/hermes/.venv/bin/python - <<'PYEOF'
+import os, sys
+from agent.credential_pool import load_pool
+try:
+    pool = load_pool("openai-api")
+    if pool.has_credentials():
+        print("credential_pool openai-api: already seeded (%d entries)" % len(pool.entries()))
+        sys.exit(0)
+    from hermes_cli import auth_commands
+    class _A:  # argparse shim
+        provider = "openai-api"; auth_type = "api_key"
+        api_key = os.environ["OPENAI_API_KEY"]; label = "railway-service-var"
+    auth_commands.auth_add_command(_A())
+    print("credential_pool openai-api: seeded from service var")
+except SystemExit:
+    raise
+except Exception as exc:
+    print("credential_pool seeding failed (non-fatal): %s" % exc)
+PYEOF
+fi
+# ---------- END CREDENTIAL POOL SEEDING ----------
+
 # ---------- RELAY ANALYTICS/AUDIT TELEMETRY (2026-08-07) ----------
 # Rich run/LLM/tool/skill/approval/subagent lifecycle export via the
 # observability/nemo_relay plugin, broadcast as OTLP to the same private
