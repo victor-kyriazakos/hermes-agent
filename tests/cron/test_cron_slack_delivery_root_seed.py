@@ -114,7 +114,6 @@ class TestDeliveryRootSeeding:
         ), f"no thread-keyed session created: {create_calls}"
         # And the brief was mirrored into it.
         assert mirror.called
-        m_kwargs = mirror.call_args.kwargs
         assert "Nightly brief." in mirror.call_args.args[2]
 
     def test_flat_mode_does_not_seed(self):
