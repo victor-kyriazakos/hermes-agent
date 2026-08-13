@@ -68,8 +68,49 @@ printf 'flex_env2 symlink=%s dotfiles=seeded\n' "$(readlink /usr/local/bin/herme
 /command/s6-setuidgid hermes /opt/hermes/.venv/bin/hermes --version >/dev/null
 /command/s6-setuidgid hermes /opt/hermes/.venv/bin/python -m hermes_cli.main --help >/dev/null
 printf '%s\n' 'hermes_runtime_cli_preflight=passed'
-/command/s6-setuidgid hermes /opt/hermes/.venv/bin/hermes config set model.default gpt-5.6-terra
-/command/s6-setuidgid hermes /opt/hermes/.venv/bin/hermes config set model.provider openai-api
+
+# ---------- MANAGED SCOPE (IT policy layer, 2026-08-13) ----------
+# Exercises hermes-agent managed scope (PR #49098): root-owned /etc/hermes
+# supplies config.yaml + .env values that win per-leaf over the user layer.
+# This block runs in the wrapper's ROOT window (before s6-setuidgid drops to
+# the hermes user), which is exactly the enterprise provisioning shape: IT
+# automation writes the policy as root; the runtime user can read, not write.
+# NOTE: /etc/hermes deliberately — NOT under /opt/data. The hermes user owns
+# /opt/data, and owning the parent directory is enough to unlink a root-owned
+# subdirectory. The managed dir must live under a root-owned parent.
+# Gated on HERMES_MANAGED_RELAY_URL so other fleet boxes are unaffected.
+if [ -n "${HERMES_MANAGED_RELAY_URL:-}" ]; then
+  mkdir -p /etc/hermes
+  cat > /etc/hermes/config.yaml <<EOFMANAGED
+# Managed by IT (staging simulation). Users cannot edit or override these keys.
+gateway:
+  relay_url: ${HERMES_MANAGED_RELAY_URL}
+  idp:
+    token_url: ${HERMES_MANAGED_IDP_TOKEN_URL}
+model:
+  default: gpt-5.6-terra
+  provider: openai-api
+providers:
+  openai-api:
+    models:
+      - gpt-5.6-terra
+      - gpt-5.6-luna
+EOFMANAGED
+  cat > /etc/hermes/.env <<EOFMANAGEDENV
+GATEWAY_RELAY_IDP_CLIENT_ID=${HERMES_MANAGED_IDP_CLIENT_ID}
+GATEWAY_RELAY_IDP_CLIENT_SECRET=${HERMES_MANAGED_IDP_CLIENT_SECRET}
+EOFMANAGEDENV
+  chmod 0755 /etc/hermes
+  chmod 0644 /etc/hermes/config.yaml /etc/hermes/.env
+  chown -R root:root /etc/hermes
+  printf 'managed_scope ACTIVE dir=/etc/hermes (relay_url+idp.token_url+model pins in config.yaml; idp client creds in .env)\n'
+fi
+# ---------- END MANAGED SCOPE ----------
+
+# NOTE: model.default/model.provider sets tolerate managed-scope refusal —
+# when IT pins these keys the refusal IS the correct behavior, not a boot error.
+/command/s6-setuidgid hermes /opt/hermes/.venv/bin/hermes config set model.default gpt-5.6-terra || true
+/command/s6-setuidgid hermes /opt/hermes/.venv/bin/hermes config set model.provider openai-api || true
 /command/s6-setuidgid hermes /opt/hermes/.venv/bin/hermes config set model.base_url https://api.openai.com/v1
 /command/s6-setuidgid hermes /opt/hermes/.venv/bin/hermes config set model.api_mode codex_responses
 /command/s6-setuidgid hermes /opt/hermes/.venv/bin/hermes config set agent.reasoning_effort medium
