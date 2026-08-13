@@ -1384,6 +1384,63 @@ def _origin_delivery_thread(origin: dict):
     return origin.get("thread_id")
 
 
+def _slack_delivery_thread_sessions_enabled(adapter) -> bool:
+    """True when the Slack surface runs thread-per-message session keying.
+
+    In that mode (relay slack extra ``reply_in_thread`` on + DM top-level
+    threads-as-sessions on — the SAME gates the adapter's inbound session
+    stamp uses) every top-level delivery is the root of a future thread, and
+    a user reply under it resolves to a NEW thread-keyed session that nothing
+    else seeds. Flat mode returns False: replies join the flat chat session,
+    where the existing delivery mirror already provides continuity. Fails
+    safe to False for adapters without these gates (native Slack keeps its
+    own inbound thread_ts stamping; other platforms have no such split).
+    """
+    try:
+        reply_in_thread = getattr(adapter, "_effective_reply_in_thread", None)
+        dm_sessions = getattr(adapter, "_dm_top_level_threads_as_sessions", None)
+        if not callable(reply_in_thread) or not callable(dm_sessions):
+            return False
+        return bool(reply_in_thread()) and bool(dm_sessions())
+    except Exception:
+        return False
+
+
+def _seed_slack_delivery_root_session(
+    job: dict,
+    adapter,
+    chat_id: str,
+    delivered_message_id: str,
+    mirror_text: str,
+    chat_name=None,
+) -> bool:
+    """Seed the thread-keyed session under a Slack cron delivery root.
+
+    Thread-per-message parity: the delivered brief's own message is the
+    anchor of the thread a user reply will open, and that reply resolves to
+    session ``(slack, chat_id, thread=<delivery ts>)``. Reuses
+    ``_seed_cron_thread_session`` keyed on the delivery root, so the first
+    in-thread reply has the brief in context — the exact continuity a flat
+    DM's mirror provides in flat mode. Best-effort: a successful delivery is
+    never failed by a seeding problem.
+    """
+    if not delivered_message_id:
+        return False
+    try:
+        _seed_cron_thread_session(
+            job, adapter, "slack", chat_id,
+            str(delivered_message_id), mirror_text,
+            chat_name=chat_name,
+        )
+        return True
+    except Exception:
+        logger.debug(
+            "Job '%s': slack delivery-root seed failed for %s",
+            job.get("id", "?"), chat_id, exc_info=True,
+        )
+        return False
+
+
 def _resolve_single_delivery_target(job: dict, deliver_value: str) -> Optional[dict]:
     """Resolve one concrete auto-delivery target for a cron job."""
 
@@ -2052,6 +2109,7 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
                 text_to_send = cleaned_delivery_content.strip()
                 adapter_ok = True
                 timed_out = False
+                delivered_message_id = None
                 if text_to_send:
                     from agent.async_utils import safe_schedule_threadsafe
 
@@ -2149,9 +2207,11 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
                             if isinstance(send_result, dict):
                                 send_success = bool(send_result.get("success", False))
                                 send_raw_response = send_result.get("raw_response")
+                                delivered_message_id = send_result.get("message_id")
                             else:
                                 send_success = _confirm_adapter_delivery(send_result)
                                 send_raw_response = getattr(send_result, "raw_response", None)
+                                delivered_message_id = getattr(send_result, "message_id", None)
 
                             if not send_success:
                                 if isinstance(send_result, dict):
@@ -2246,6 +2306,40 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
                             job, runtime_adapter, platform_name, chat_id,
                             mirror_text, is_dm=is_dm_target,
                             user_id=origin_user_id,
+                            chat_name=origin.get("chat_name"),
+                        )
+                    # Slack thread-per-message parity: a top-level delivery is
+                    # the root of the thread a user reply will open, and that
+                    # reply resolves to a thread-keyed session nothing above
+                    # seeded (the flat mirror is invisible from inside the
+                    # thread; the named attach thread is a different thread).
+                    # Seed the delivery root's own thread session with the
+                    # brief so ANY in-thread reply has the job in context.
+                    # DEFAULT-ON (unlike the flat mirror): the seeded session
+                    # is dedicated to this delivery root — it shares no
+                    # transcript with any existing conversation, so the
+                    # historical isolation guarantee the mirror gate protects
+                    # is not in play. Gated on the SAME adapter mode gates the
+                    # inbound session stamp uses — flat-mode deployments
+                    # (reply_in_thread off) never enter here, and a delivery
+                    # already routed into a thread (explicit/origin/named)
+                    # keys that thread instead.
+                    if (
+                        platform == Platform.SLACK
+                        and not thread_seeded
+                        and not thread_id
+                        and delivered_message_id
+                        and _slack_delivery_thread_sessions_enabled(runtime_adapter)
+                    ):
+                        seed_text = mirror_text
+                        if not seed_text:
+                            # mirror gate off -> mirror_text was never computed;
+                            # derive the same clean (media-tag-free) text here.
+                            _, seed_text = BasePlatformAdapter.extract_media(content)
+                            seed_text = (seed_text or "").strip()
+                        thread_seeded = _seed_slack_delivery_root_session(
+                            job, runtime_adapter, chat_id,
+                            delivered_message_id, seed_text,
                             chat_name=origin.get("chat_name"),
                         )
                     _maybe_mirror_cron_delivery(
