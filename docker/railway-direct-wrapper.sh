@@ -87,6 +87,15 @@ gateway:
   relay_url: ${HERMES_MANAGED_RELAY_URL}
   idp:
     token_url: ${HERMES_MANAGED_IDP_TOKEN_URL}
+# Platform ENABLE path: gateway/config.py reads platforms.relay.extra.relay_url
+# (or the GATEWAY_RELAY_URL env var) to bring the relay into the connect loop.
+# gateway.relay_url above covers the dial/self-provision path only — both are
+# needed when the env var is absent.
+platforms:
+  relay:
+    enabled: true
+    extra:
+      relay_url: ${HERMES_MANAGED_RELAY_URL}
 model:
   default: gpt-5.6-terra
   provider: openai-api
