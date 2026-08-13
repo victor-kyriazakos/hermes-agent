@@ -99,11 +99,11 @@ platforms:
 model:
   default: gpt-5.6-terra
   provider: openai-api
-providers:
-  openai-api:
-    models:
-      - gpt-5.6-terra
-      - gpt-5.6-luna
+# NOTE: providers.<slug>.models is NOT an enforcement key (it widens
+# acceptance for models missing from live listings; it never narrows).
+# The supported fleet-wide model policy is: pin model.default here +
+# gate the /model command via platforms.<p>.extra.allow_admin_from /
+# user_allowed_commands (guide 10 appendix A.1/A.2).
 EOFMANAGED
   cat > /etc/hermes/.env <<EOFMANAGEDENV
 GATEWAY_RELAY_IDP_CLIENT_ID=${HERMES_MANAGED_IDP_CLIENT_ID}
