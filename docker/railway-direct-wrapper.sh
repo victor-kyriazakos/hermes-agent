@@ -136,6 +136,25 @@ fi
 /command/s6-setuidgid hermes /opt/hermes/.venv/bin/hermes config set monitoring.export.otlp.endpoint http://otel-collector.railway.internal:4318/v1/traces
 /command/s6-setuidgid hermes /opt/hermes/.venv/bin/python /opt/hermes/docker/ensure_platform_toolset.py slack terminal
 
+# ---------- RELAY SLACK CONFIG MATRIX (2026-08-19, rc.4 parity testing) ----------
+# Per-box relay Slack behavior knobs (platforms.relay.extra.slack.*) driven by
+# ONE Railway service var so the fleet can hold a different combination per box
+# for the #90038/#214 parity matrix without branch churn.
+#
+#   HERMES_RELAY_SLACK_KNOBS="reply_in_thread=false,cron_continuable_surface=in_channel,markdown_blocks=true"
+#
+# Comma-separated key=value pairs; keys land verbatim under
+# platforms.relay.extra.slack.<key>. Unset var = no writes = shipping defaults
+# (thread surface, threaded replies, plain mrkdwn) — the control cell.
+if [ -n "${HERMES_RELAY_SLACK_KNOBS:-}" ]; then
+  printf 'relay_slack_knobs ACTIVE: %s\n' "${HERMES_RELAY_SLACK_KNOBS}"
+  echo "${HERMES_RELAY_SLACK_KNOBS}" | tr ',' '\n' | while IFS='=' read -r k v; do
+    [ -n "$k" ] && [ -n "$v" ] && \
+      /command/s6-setuidgid hermes /opt/hermes/.venv/bin/hermes config set "platforms.relay.extra.slack.${k}" "${v}" || true
+  done
+fi
+# ---------- END RELAY SLACK CONFIG MATRIX ----------
+
 # ---------- CREDENTIAL POOL SEEDING (2026-08-10) ----------
 # Terminal/execute_code subprocesses deliberately strip provider API keys
 # from the child env (GHSA-rhgp-j443-p4rf posture; env_passthrough refuses
