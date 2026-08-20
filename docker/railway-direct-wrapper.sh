@@ -127,6 +127,11 @@ fi
 /command/s6-setuidgid hermes /opt/hermes/.venv/bin/hermes config set streaming.transport auto
 /command/s6-setuidgid hermes /opt/hermes/.venv/bin/hermes config set display.platforms.slack.tool_progress all
 /command/s6-setuidgid hermes /opt/hermes/.venv/bin/hermes config set display.platforms.slack.tool_progress_grouping accumulate
+# Continuable-cron testing (2026-08-20): mirror every origin delivery into the
+# target chat's session so replies to a cron brief continue in-context even
+# when the job was created without attach_to_session (the B-matrix global-on
+# cells; per-job attach_to_session=false still opts out — precedence tested).
+/command/s6-setuidgid hermes /opt/hermes/.venv/bin/hermes config set cron.mirror_delivery true
 /command/s6-setuidgid hermes /opt/hermes/.venv/bin/hermes config set monitoring.gateway_health_export.enabled true
 /command/s6-setuidgid hermes /opt/hermes/.venv/bin/hermes config set monitoring.gateway_health_export.metrics_enabled true
 /command/s6-setuidgid hermes /opt/hermes/.venv/bin/hermes config set monitoring.gateway_health_export.diagnostic_events_enabled true
