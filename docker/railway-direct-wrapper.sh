@@ -228,7 +228,13 @@ if [ "${HERMES_STAGING_DISABLE_NEMO_RELAY:-0}" = "1" ]; then
   /command/s6-setuidgid hermes /opt/hermes/.venv/bin/hermes plugins disable observability/nemo_relay || true
   printf 'relay_telemetry DISABLED by HERMES_STAGING_DISABLE_NEMO_RELAY probe guard\n'
 else
-/command/s6-setuidgid hermes /opt/hermes/.venv/bin/hermes plugins enable observability/nemo_relay
+# Native plugin cutover (main 31402f630b, 2026-08-19): the observability/
+# nemo_relay plugin key was REMOVED and `hermes plugins enable` on it now
+# hard-exits 1 (crash-looped Alice on rc4-release, deploy 5ca418ee). Relay
+# lifecycle is owned by Hermes core and configured solely via
+# HERMES_NEMO_RELAY_PLUGINS_TOML — which this block already writes and
+# exports below. The disable arm above keeps its `|| true` and stays
+# harmless on both lineages.
 instance_hash="$(/command/s6-setuidgid hermes /opt/hermes/.venv/bin/python - <<'PYEOF'
 import hashlib
 from hermes_cli.config import load_config
