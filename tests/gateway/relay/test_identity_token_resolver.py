@@ -56,8 +56,9 @@ def test_client_credentials_via_env(monkeypatch):
 
     monkeypatch.setattr("urllib.request.urlopen", fake_urlopen)
 
-    token = relay._resolve_relay_identity_token()
+    token, source = relay._resolve_relay_identity_credentials()
     assert token == "idp-workload-token"
+    assert source == "gateway_idp"
     assert captured["url"] == "https://idp.test/token"
     assert captured["method"] == "POST"
     # client_credentials grant, form-encoded, with all fields.
@@ -105,8 +106,9 @@ def test_ambient_get_when_no_client_credentials(monkeypatch):
 
     monkeypatch.setattr("urllib.request.urlopen", fake_urlopen)
 
-    token = relay._resolve_relay_identity_token()
+    token, source = relay._resolve_relay_identity_credentials()
     assert token == _FAKE_JWT  # raw body, whitespace-trimmed
+    assert source == "gateway_idp"
     assert captured["url"] == "https://proxy.local/access-token"
     assert captured["method"] == "GET"
     assert captured["body"] is None  # no form payload on the ambient path
@@ -255,3 +257,15 @@ def test_ambient_via_config_yaml(monkeypatch):
 
     monkeypatch.setattr("urllib.request.urlopen", fake_urlopen)
     assert relay._resolve_relay_identity_token() == _FAKE_JWT
+
+
+def test_default_portal_resolver_reports_portal_provenance(monkeypatch):
+    monkeypatch.setattr(
+        "hermes_cli.auth.resolve_nous_access_token",
+        lambda: "portal-token",
+    )
+
+    assert relay._resolve_relay_identity_credentials() == (
+        "portal-token",
+        "nous_portal",
+    )

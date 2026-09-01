@@ -518,8 +518,8 @@ def _post_provision(
     return payload
 
 
-def _resolve_relay_identity_token() -> str:
-    """Resolve the caller-identity bearer token the connector introspects to a tenant.
+def _resolve_relay_identity_credentials() -> tuple[str, str]:
+    """Resolve bearer token and trusted provenance as one atomic result.
 
     Canonical resolver shared by the runtime self-provision path and the
     ``hermes gateway enroll`` CLI. Three modes, in precedence order:
@@ -564,7 +564,7 @@ def _resolve_relay_identity_token() -> str:
         # Mode 2 — Nous Portal (default, unchanged behaviour).
         from hermes_cli.auth import resolve_nous_access_token
 
-        return resolve_nous_access_token()
+        return resolve_nous_access_token(), "nous_portal"
 
     import json
     import urllib.error
@@ -602,7 +602,7 @@ def _resolve_relay_identity_token() -> str:
                 "was not a token. For the OAuth2 client_credentials grant, configure "
                 "client_id and client_secret alongside token_url."
             )
-        return token
+        return token, "gateway_idp"
 
     if not client_id or not client_secret:
         # Exactly one credential configured: this is a mistyped client_credentials
@@ -637,7 +637,12 @@ def _resolve_relay_identity_token() -> str:
     access_token = (payload or {}).get("access_token")
     if not isinstance(access_token, str) or not access_token.strip():
         raise RuntimeError("IdP client_credentials response had no access_token")
-    return access_token.strip()
+    return access_token.strip(), "gateway_idp"
+
+
+def _resolve_relay_identity_token() -> str:
+    """Compatibility wrapper returning only the resolved bearer token."""
+    return _resolve_relay_identity_credentials()[0]
 
 
 def self_provision_relay() -> bool:

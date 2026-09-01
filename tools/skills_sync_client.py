@@ -63,6 +63,7 @@ import stat as _stat
 from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath
 from typing import Any, Callable, Dict, List, Optional, Tuple
+from urllib.parse import urlparse
 
 logger = logging.getLogger(__name__)
 
@@ -242,17 +243,21 @@ def _decode_jwt_payload_unverified(token: str) -> Dict[str, Any]:
         return {}
 
 
-def _generic_relay_idp_configured() -> bool:
-    """Whether the canonical relay resolver will use an explicit generic IdP."""
-    if os.environ.get("GATEWAY_RELAY_IDP_TOKEN_URL", "").strip():
-        return True
-    try:
-        from gateway.run import _load_gateway_config
+_NOUS_PORTAL_ISSUER_HOSTS = frozenset(
+    {
+        "portal.nousresearch.com",
+        "portal.staging-nousresearch.com",
+    }
+)
 
-        idp = ((_load_gateway_config().get("gateway") or {}).get("idp") or {})
-        return bool(str(idp.get("token_url", "") or "").strip())
-    except Exception:
+
+def _is_nous_portal_issuer(claims: Dict[str, Any]) -> bool:
+    """Recognize production/staging Portal JWT issuers despite resolver config."""
+    issuer = claims.get("iss")
+    if not isinstance(issuer, str):
         return False
+    parsed = urlparse(issuer.strip())
+    return parsed.scheme == "https" and parsed.hostname in _NOUS_PORTAL_ISSUER_HOSTS
 
 
 def resolve_identity() -> Dict[str, Any]:
@@ -265,22 +270,26 @@ def resolve_identity() -> Dict[str, Any]:
     ``nous_admin`` and ``base_url`` remain for compatibility. ``owner`` comes
     only from stable ``sub``; tenant identifiers are not user/workload owners.
     """
-    generic_idp = _generic_relay_idp_configured()
     try:
-        from gateway.relay import _resolve_relay_identity_token
+        from gateway.relay import _resolve_relay_identity_credentials
 
-        api_key = _resolve_relay_identity_token()
+        api_key, identity_source = _resolve_relay_identity_credentials()
     except Exception as e:
         raise SyncInertError(f"no identity credentials: {e}") from e
 
     if not api_key:
         raise SyncInertError("no bearer token available")
+    if identity_source not in {"gateway_idp", "nous_portal"}:
+        raise SyncInertError("identity resolver returned unknown provenance")
 
     claims = _decode_jwt_payload_unverified(api_key)
+    if identity_source == "gateway_idp" and _is_nous_portal_issuer(claims):
+        identity_source = "nous_portal"
     owner = claims.get("sub")
     if not isinstance(owner, str) or not owner.strip():
         raise SyncInertError("identity token has no stable subject")
     nous_admin = claims.get(NOUS_ADMIN_CLAIM) is True
+    generic_idp = identity_source == "gateway_idp"
     access_allowed = generic_idp or nous_admin
     return {
         "api_key": api_key,
@@ -288,7 +297,7 @@ def resolve_identity() -> Dict[str, Any]:
         "owner": str(owner),
         "nous_admin": nous_admin,
         "claims": claims,
-        "identity_source": "gateway_idp" if generic_idp else "nous_portal",
+        "identity_source": identity_source,
         "access_allowed": access_allowed,
         "access_reason": (
             "generic_idp_server_authoritative"

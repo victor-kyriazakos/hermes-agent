@@ -279,6 +279,16 @@ def _jwt(claims: dict) -> str:
     return _pyjwt.encode(claims, "x" * 32, algorithm="HS256")
 
 
+def _patch_resolved_identity(monkeypatch, token: str, source: str = "nous_portal"):
+    import gateway.relay as relay
+
+    monkeypatch.setattr(
+        relay,
+        "_resolve_relay_identity_credentials",
+        lambda: (token, source),
+    )
+
+
 # ---------------------------------------------------------------------------
 # Content addressing & canonicalization (contract §2.1, §2.5, OI-5)
 # ---------------------------------------------------------------------------
@@ -321,7 +331,7 @@ class TestDevGate:
         token = _jwt({"sub": "user1", "tool_gateway_admin": True})
         import gateway.relay as relay
 
-        monkeypatch.setattr(relay, "_resolve_relay_identity_token", lambda: token)
+        _patch_resolved_identity(monkeypatch, token)
         ident = ssc.resolve_identity()
         assert ident["nous_admin"] is True
         assert ident["owner"] == "user1"
@@ -330,7 +340,7 @@ class TestDevGate:
         token = _jwt({"sub": "user1"})  # no tool_gateway_admin
         import gateway.relay as relay
 
-        monkeypatch.setattr(relay, "_resolve_relay_identity_token", lambda: token)
+        _patch_resolved_identity(monkeypatch, token)
         ident = ssc.resolve_identity()
         assert ident["nous_admin"] is False
 
@@ -338,14 +348,14 @@ class TestDevGate:
         token = _jwt({"sub": "u", "tool_gateway_admin": False})
         import gateway.relay as relay
 
-        monkeypatch.setattr(relay, "_resolve_relay_identity_token", lambda: token)
+        _patch_resolved_identity(monkeypatch, token)
         assert ssc.dev_gate_open() is False
 
     def test_maybe_push_inert_when_gate_closed(self, monkeypatch):
         token = _jwt({"sub": "u"})
         import gateway.relay as relay
 
-        monkeypatch.setattr(relay, "_resolve_relay_identity_token", lambda: token)
+        _patch_resolved_identity(monkeypatch, token)
         monkeypatch.setattr(ssc, "resolve_sync_base_url", lambda: "http://x")
         # gate closed -> None (inert), never attempts a push
         assert ssc.maybe_push_skills() is None
@@ -356,7 +366,7 @@ class TestDevGate:
         def _raise(**kw):
             raise RuntimeError("not logged in")
 
-        monkeypatch.setattr(relay, "_resolve_relay_identity_token", _raise)
+        monkeypatch.setattr(relay, "_resolve_relay_identity_credentials", _raise)
         assert ssc.maybe_pull_skills() is None
 
     def test_explicit_generic_idp_allows_sync_without_nous_admin_claim(
@@ -366,7 +376,7 @@ class TestDevGate:
         monkeypatch.setenv("GATEWAY_RELAY_IDP_TOKEN_URL", "https://idp/token")
         import gateway.relay as relay
 
-        monkeypatch.setattr(relay, "_resolve_relay_identity_token", lambda: token)
+        _patch_resolved_identity(monkeypatch, token, "gateway_idp")
 
         ident = ssc.resolve_identity()
 
@@ -389,7 +399,7 @@ class TestDevGate:
             "_load_gateway_config",
             lambda: {"gateway": {"idp": {"token_url": "http://metadata/token"}}},
         )
-        monkeypatch.setattr(relay, "_resolve_relay_identity_token", lambda: token)
+        _patch_resolved_identity(monkeypatch, token, "gateway_idp")
 
         ident = ssc.resolve_identity()
 
@@ -404,7 +414,27 @@ class TestDevGate:
         import gateway.run as gateway_run
 
         monkeypatch.setattr(gateway_run, "_load_gateway_config", lambda: {})
-        monkeypatch.setattr(relay, "_resolve_relay_identity_token", lambda: token)
+        _patch_resolved_identity(monkeypatch, token)
+
+        ident = ssc.resolve_identity()
+
+        assert ident["identity_source"] == "nous_portal"
+        assert ident["access_allowed"] is False
+        assert ssc.dev_gate_open() is False
+
+    def test_portal_issuer_prevents_gate_bypass_via_generic_idp_config(
+        self, monkeypatch
+    ):
+        token = _jwt(
+            {
+                "sub": "legacy-workload",
+                "iss": "https://portal.nousresearch.com",
+            }
+        )
+        monkeypatch.setenv("GATEWAY_RELAY_IDP_TOKEN_URL", "https://idp.example/token")
+        monkeypatch.setenv("GATEWAY_RELAY_IDP_CLIENT_ID", "hermes-box")
+        monkeypatch.setenv("GATEWAY_RELAY_IDP_CLIENT_SECRET", "secret")
+        _patch_resolved_identity(monkeypatch, token, "gateway_idp")
 
         ident = ssc.resolve_identity()
 
@@ -425,7 +455,7 @@ class TestDevGate:
         monkeypatch.setenv("GATEWAY_RELAY_IDP_TOKEN_URL", "https://idp/token")
         import gateway.relay as relay
 
-        monkeypatch.setattr(relay, "_resolve_relay_identity_token", lambda: token)
+        _patch_resolved_identity(monkeypatch, token, "gateway_idp")
 
         with pytest.raises(ssc.SyncInertError, match="stable subject"):
             ssc.resolve_identity()
@@ -1005,7 +1035,7 @@ class TestOrgIdentityGate:
         token = _jwt({"sub": "u", "org_id": "org-1"})
         import gateway.relay as relay
 
-        monkeypatch.setattr(relay, "_resolve_relay_identity_token", lambda: token)
+        _patch_resolved_identity(monkeypatch, token)
         with pytest.raises(ssc.SyncInertError):
             ssc.resolve_org_identity()
         assert ssc.org_sync_available() is False
@@ -1014,7 +1044,7 @@ class TestOrgIdentityGate:
         token = _jwt({"sub": "u", "org_id": "org-9", "org_role": "MEMBER"})
         import gateway.relay as relay
 
-        monkeypatch.setattr(relay, "_resolve_relay_identity_token", lambda: token)
+        _patch_resolved_identity(monkeypatch, token)
         ident = ssc.resolve_org_identity()
         assert ident["org_id"] == "org-9"
         assert ident["org_role"] == "MEMBER"
@@ -1133,7 +1163,7 @@ class TestOrgEndToEnd:
         token = _jwt({"sub": "u", "org_id": "org-1"})
         import gateway.relay as relay
 
-        monkeypatch.setattr(relay, "_resolve_relay_identity_token", lambda: token)
+        _patch_resolved_identity(monkeypatch, token)
         assert ssc.maybe_pull_org_skills() is None
 
 
