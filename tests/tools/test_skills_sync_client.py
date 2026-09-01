@@ -53,6 +53,16 @@ def _make_handler(state: _MockState):
         def log_message(self, format, *args):  # silence
             pass
 
+        def _caller_owner(self):
+            authorization = self.headers.get("Authorization", "")
+            if not authorization.startswith("Bearer "):
+                return None
+            claims = ssc._decode_jwt_payload_unverified(
+                authorization[len("Bearer "):]
+            )
+            owner = claims.get("sub")
+            return owner if isinstance(owner, str) and owner.strip() else None
+
         def _json(self, code, obj, extra_headers=None):
             body = json.dumps(obj).encode("utf-8")
             self.send_response(code)
@@ -80,6 +90,7 @@ def _make_handler(state: _MockState):
                 })
 
             if path == "/v1/sync/refs":
+                caller_owner = self._caller_owner()
                 prefix = ""
                 for part in query.split("&"):
                     if part.startswith("prefix="):
@@ -93,7 +104,9 @@ def _make_handler(state: _MockState):
                 refs = [
                     {"name": n, "hash": h}
                     for n, h in state.refs.items()
-                    if n.startswith(prefix) and not n.startswith("refs/org/")
+                    if n.startswith(prefix)
+                    and caller_owner is not None
+                    and n.startswith(f"refs/user/{caller_owner}/")
                 ]
                 return self._json(200, {"refs": refs})
 
@@ -207,6 +220,10 @@ def _make_handler(state: _MockState):
             body = json.loads(raw.decode("utf-8")) if raw else {}
             frm = body.get("from")
             to = body.get("to")
+            if name.startswith("refs/user/") and not name.startswith(
+                f"refs/user/{self._caller_owner()}/"
+            ):
+                return self._json(403, {"error": "forbidden"})
             # M2 (contract §11.5): a non-admin member's CAS on an org HEAD is
             # accept-always converted to a proposal → 202.
             if name.startswith("refs/org/") and not state.org_role_admin:
@@ -302,50 +319,138 @@ class TestAddressing:
 class TestDevGate:
     def test_gate_open_with_claim(self, monkeypatch):
         token = _jwt({"sub": "user1", "tool_gateway_admin": True})
-        monkeypatch.setattr(
-            ssc, "resolve_nous_runtime_credentials",
-            lambda **kw: {"api_key": token, "base_url": "https://x"}, raising=False,
-        )
-        # patch the lazily-imported symbol used inside resolve_identity
-        import hermes_cli.auth as auth_mod
-        monkeypatch.setattr(auth_mod, "resolve_nous_runtime_credentials",
-                            lambda **kw: {"api_key": token, "base_url": "https://x"})
+        import gateway.relay as relay
+
+        monkeypatch.setattr(relay, "_resolve_relay_identity_token", lambda: token)
         ident = ssc.resolve_identity()
         assert ident["nous_admin"] is True
         assert ident["owner"] == "user1"
 
     def test_gate_closed_without_claim(self, monkeypatch):
         token = _jwt({"sub": "user1"})  # no tool_gateway_admin
-        import hermes_cli.auth as auth_mod
-        monkeypatch.setattr(auth_mod, "resolve_nous_runtime_credentials",
-                            lambda **kw: {"api_key": token, "base_url": "https://x"})
+        import gateway.relay as relay
+
+        monkeypatch.setattr(relay, "_resolve_relay_identity_token", lambda: token)
         ident = ssc.resolve_identity()
         assert ident["nous_admin"] is False
 
     def test_gate_closed_when_claim_false(self, monkeypatch):
         token = _jwt({"sub": "u", "tool_gateway_admin": False})
-        import hermes_cli.auth as auth_mod
-        monkeypatch.setattr(auth_mod, "resolve_nous_runtime_credentials",
-                            lambda **kw: {"api_key": token, "base_url": "https://x"})
+        import gateway.relay as relay
+
+        monkeypatch.setattr(relay, "_resolve_relay_identity_token", lambda: token)
         assert ssc.dev_gate_open() is False
 
     def test_maybe_push_inert_when_gate_closed(self, monkeypatch):
         token = _jwt({"sub": "u"})
-        import hermes_cli.auth as auth_mod
-        monkeypatch.setattr(auth_mod, "resolve_nous_runtime_credentials",
-                            lambda **kw: {"api_key": token})
+        import gateway.relay as relay
+
+        monkeypatch.setattr(relay, "_resolve_relay_identity_token", lambda: token)
         monkeypatch.setattr(ssc, "resolve_sync_base_url", lambda: "http://x")
         # gate closed -> None (inert), never attempts a push
         assert ssc.maybe_push_skills() is None
 
     def test_maybe_pull_inert_when_not_logged_in(self, monkeypatch):
-        import hermes_cli.auth as auth_mod
+        import gateway.relay as relay
 
         def _raise(**kw):
             raise RuntimeError("not logged in")
 
-        monkeypatch.setattr(auth_mod, "resolve_nous_runtime_credentials", _raise)
+        monkeypatch.setattr(relay, "_resolve_relay_identity_token", _raise)
         assert ssc.maybe_pull_skills() is None
+
+    def test_explicit_generic_idp_allows_sync_without_nous_admin_claim(
+        self, monkeypatch
+    ):
+        token = _jwt({"sub": "enterprise-workload"})
+        monkeypatch.setenv("GATEWAY_RELAY_IDP_TOKEN_URL", "https://idp/token")
+        import gateway.relay as relay
+
+        monkeypatch.setattr(relay, "_resolve_relay_identity_token", lambda: token)
+
+        ident = ssc.resolve_identity()
+
+        assert ident["owner"] == "enterprise-workload"
+        assert ident["nous_admin"] is False
+        assert ident["identity_source"] == "gateway_idp"
+        assert ident["access_allowed"] is True
+        assert ssc.dev_gate_open() is True
+
+    def test_configured_ambient_idp_endpoint_is_generic_source(
+        self, monkeypatch
+    ):
+        token = _jwt({"sub": "ambient-workload", "tid": "unstable-tenant"})
+        monkeypatch.delenv("GATEWAY_RELAY_IDP_TOKEN_URL", raising=False)
+        import gateway.relay as relay
+        import gateway.run as gateway_run
+
+        monkeypatch.setattr(
+            gateway_run,
+            "_load_gateway_config",
+            lambda: {"gateway": {"idp": {"token_url": "http://metadata/token"}}},
+        )
+        monkeypatch.setattr(relay, "_resolve_relay_identity_token", lambda: token)
+
+        ident = ssc.resolve_identity()
+
+        assert ident["owner"] == "ambient-workload"
+        assert ident["identity_source"] == "gateway_idp"
+        assert ident["access_allowed"] is True
+
+    def test_nous_portal_token_still_requires_admin_claim(self, monkeypatch):
+        token = _jwt({"sub": "portal-user"})
+        monkeypatch.delenv("GATEWAY_RELAY_IDP_TOKEN_URL", raising=False)
+        import gateway.relay as relay
+        import gateway.run as gateway_run
+
+        monkeypatch.setattr(gateway_run, "_load_gateway_config", lambda: {})
+        monkeypatch.setattr(relay, "_resolve_relay_identity_token", lambda: token)
+
+        ident = ssc.resolve_identity()
+
+        assert ident["identity_source"] == "nous_portal"
+        assert ident["access_allowed"] is False
+        assert ssc.dev_gate_open() is False
+
+    @pytest.mark.parametrize(
+        "claims",
+        [
+            {"tid": "tenant-is-not-owner"},
+            {"sub": "   ", "tid": "tenant-is-not-owner"},
+        ],
+        ids=["missing-sub", "blank-sub"],
+    )
+    def test_generic_idp_without_stable_subject_is_inert(self, monkeypatch, claims):
+        token = _jwt(claims)
+        monkeypatch.setenv("GATEWAY_RELAY_IDP_TOKEN_URL", "https://idp/token")
+        import gateway.relay as relay
+
+        monkeypatch.setattr(relay, "_resolve_relay_identity_token", lambda: token)
+
+        with pytest.raises(ssc.SyncInertError, match="stable subject"):
+            ssc.resolve_identity()
+        assert ssc.dev_gate_open() is False
+
+    def test_status_exposes_identity_source_and_access_state(self, monkeypatch):
+        monkeypatch.setattr(
+            ssc,
+            "resolve_identity",
+            lambda: {
+                "owner": "workload",
+                "nous_admin": False,
+                "identity_source": "gateway_idp",
+                "access_allowed": True,
+                "access_reason": "generic_idp_server_authoritative",
+            },
+        )
+        monkeypatch.setattr(ssc, "resolve_org_identity", lambda: (_ for _ in ()).throw(ssc.SyncInertError()))
+
+        status = ssc.sync_status()
+
+        assert status["identity_source"] == "gateway_idp"
+        assert status["access_allowed"] is True
+        assert status["access_reason"] == "generic_idp_server_authoritative"
+        assert status["nous_admin"] is False  # compatibility field remains
 
 
 # ---------------------------------------------------------------------------
@@ -540,6 +645,27 @@ class TestEndToEnd:
         # content materialized to disk
         assert (dev2 / "alpha" / "SKILL.md").read_text().endswith("alpha v1\n")
         assert (dev2 / "devops" / "beta" / "SKILL.md").read_text().endswith("beta v1\n")
+
+    def test_same_subject_devices_share_personal_ref_but_other_subject_cannot_read_it(
+        self, mock_server, synced_env
+    ):
+        base, state = mock_server
+        home, skills, identity = synced_env
+        owner = "shared-owner"
+        device_a_token = _jwt({"sub": owner})
+        device_b_token = _jwt({"sub": owner})
+        other_token = _jwt({"sub": "different-owner"})
+        shared_identity = {**identity, "api_key": device_a_token, "owner": owner}
+
+        pushed = ssc.push_skills(
+            ssc.SyncClient(base, device_a_token), identity=shared_identity
+        )
+
+        prefix = f"refs/user/{owner}/"
+        device_b_refs = ssc.SyncClient(base, device_b_token).get_refs(prefix)
+        other_owner_refs = ssc.SyncClient(base, other_token).get_refs(prefix)
+        assert device_b_refs == [{"name": f"{prefix}HEAD", "hash": pushed["head"]}]
+        assert other_owner_refs == []
 
     def test_push_idempotent_reupload(self, mock_server, synced_env):
         base, state = mock_server
@@ -877,18 +1003,18 @@ class TestOrgIdentityGate:
     def test_org_identity_requires_role_claim(self, monkeypatch):
         # Personal org: NAS stamps NO org_role -> inert, not an error path.
         token = _jwt({"sub": "u", "org_id": "org-1"})
-        import hermes_cli.auth as auth_mod
-        monkeypatch.setattr(auth_mod, "resolve_nous_runtime_credentials",
-                            lambda **kw: {"api_key": token, "base_url": "https://x"})
+        import gateway.relay as relay
+
+        monkeypatch.setattr(relay, "_resolve_relay_identity_token", lambda: token)
         with pytest.raises(ssc.SyncInertError):
             ssc.resolve_org_identity()
         assert ssc.org_sync_available() is False
 
     def test_org_identity_with_role(self, monkeypatch):
         token = _jwt({"sub": "u", "org_id": "org-9", "org_role": "MEMBER"})
-        import hermes_cli.auth as auth_mod
-        monkeypatch.setattr(auth_mod, "resolve_nous_runtime_credentials",
-                            lambda **kw: {"api_key": token, "base_url": "https://x"})
+        import gateway.relay as relay
+
+        monkeypatch.setattr(relay, "_resolve_relay_identity_token", lambda: token)
         ident = ssc.resolve_org_identity()
         assert ident["org_id"] == "org-9"
         assert ident["org_role"] == "MEMBER"
@@ -1005,9 +1131,9 @@ class TestOrgEndToEnd:
     def test_maybe_pull_org_inert_without_role(self, monkeypatch):
         # Personal org: no org_role claim -> None, never raises.
         token = _jwt({"sub": "u", "org_id": "org-1"})
-        import hermes_cli.auth as auth_mod
-        monkeypatch.setattr(auth_mod, "resolve_nous_runtime_credentials",
-                            lambda **kw: {"api_key": token})
+        import gateway.relay as relay
+
+        monkeypatch.setattr(relay, "_resolve_relay_identity_token", lambda: token)
         assert ssc.maybe_pull_org_skills() is None
 
 

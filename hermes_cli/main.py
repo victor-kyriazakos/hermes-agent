@@ -5787,7 +5787,7 @@ def cmd_sync(args):
             )
         if not status.get("logged_in"):
             print("\nNot logged into Nous Portal — sync is inert.", file=sys.stderr)
-        elif not status.get("nous_admin"):
+        elif not status.get("access_allowed", status.get("nous_admin")):
             print(
                 "\nSync is not enabled for your account yet.",
                 file=sys.stderr,
@@ -5812,7 +5812,7 @@ def cmd_sync(args):
     except ssc.SyncInertError as e:
         print(f"sync inert: {e}", file=sys.stderr)
         return 1
-    if not identity.get("nous_admin"):
+    if not identity.get("access_allowed", identity.get("nous_admin")):
         print(
             "sync unavailable: not enabled for your account yet.",
             file=sys.stderr,
