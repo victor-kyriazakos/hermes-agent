@@ -1,4 +1,5 @@
 import json
+from contextlib import contextmanager
 
 
 def test_status_returns_in_process_sync_state(monkeypatch):
@@ -210,3 +211,37 @@ def test_push_surfaces_unsuccessful_sync_result(monkeypatch):
         "action": "push",
         "result": {"ok": False, "conflict": True},
     }
+
+
+def test_now_holds_one_sync_lock_across_pull_and_push(monkeypatch):
+    from tools import skill_sync_tool
+
+    events = []
+
+    @contextmanager
+    def recording_operation():
+        events.append("enter")
+        yield
+        events.append("exit")
+
+    def pull_skills(*, identity):
+        assert events == ["enter"]
+        return {"ok": True, "owner": identity["owner"]}
+
+    def push_skills(*, identity, message):
+        assert events == ["enter"]
+        return {"ok": True, "owner": identity["owner"], "message": message}
+
+    monkeypatch.setattr(
+        skill_sync_tool,
+        "_ready_identity",
+        lambda: {"owner": "owner-1", "access_allowed": True},
+    )
+    monkeypatch.setattr(skill_sync_tool.ssc, "sync_operation", recording_operation)
+    monkeypatch.setattr(skill_sync_tool.ssc, "pull_skills", pull_skills)
+    monkeypatch.setattr(skill_sync_tool.ssc, "push_skills", push_skills)
+
+    result = json.loads(skill_sync_tool.skill_sync_tool(action="now"))
+
+    assert result["success"] is True
+    assert events == ["enter", "exit"]

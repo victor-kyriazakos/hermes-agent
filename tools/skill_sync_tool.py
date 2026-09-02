@@ -58,7 +58,8 @@ def skill_sync_tool(*, action: str) -> str:
     if action == "pull":
         try:
             identity = _ready_identity()
-            result = ssc.pull_skills(identity=identity)
+            with ssc.sync_operation():
+                result = ssc.pull_skills(identity=identity)
         except (ssc.SyncInertError, ssc.SyncError) as exc:
             return tool_error(f"Skill sync failed: {exc}")
         return json.dumps(
@@ -72,10 +73,11 @@ def skill_sync_tool(*, action: str) -> str:
     if action == "push":
         try:
             identity = _ready_identity()
-            result = ssc.push_skills(
-                identity=identity,
-                message="hermes skill_sync push",
-            )
+            with ssc.sync_operation():
+                result = ssc.push_skills(
+                    identity=identity,
+                    message="hermes skill_sync push",
+                )
         except (ssc.SyncInertError, ssc.SyncError) as exc:
             return tool_error(f"Skill sync failed: {exc}")
         return json.dumps(
@@ -89,11 +91,12 @@ def skill_sync_tool(*, action: str) -> str:
     if action == "now":
         try:
             identity = _ready_identity()
-            pull_result = ssc.pull_skills(identity=identity)
-            push_result = ssc.push_skills(
-                identity=identity,
-                message="hermes skill_sync now",
-            )
+            with ssc.sync_operation():
+                pull_result = ssc.pull_skills(identity=identity)
+                push_result = ssc.push_skills(
+                    identity=identity,
+                    message="hermes skill_sync now",
+                )
         except (ssc.SyncInertError, ssc.SyncError) as exc:
             return tool_error(f"Skill sync failed: {exc}")
         return json.dumps(

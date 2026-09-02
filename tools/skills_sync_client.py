@@ -60,12 +60,23 @@ import logging
 import os
 import time
 import stat as _stat
+import threading
+from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath
 from typing import Any, Callable, Dict, List, Optional, Tuple
 from urllib.parse import urlparse
 
 logger = logging.getLogger(__name__)
+
+_sync_operation_lock = threading.RLock()
+
+
+@contextmanager
+def sync_operation():
+    """Serialize sync filesystem/state operations within this Hermes process."""
+    with _sync_operation_lock:
+        yield
 
 # Sync protocol constants
 # Wire protocol version. The over-the-wire names below (the `hsp_version`
@@ -1651,7 +1662,8 @@ def maybe_push_skills(*, message: str = "hermes skill sync") -> Optional[Dict[st
             return None
         if not list_synced_skill_names():
             return None
-        return push_skills(identity=identity, message=message)
+        with sync_operation():
+            return push_skills(identity=identity, message=message)
     except Exception as e:
         logger.debug("skills_sync_client: maybe_push_skills failed: %s", e, exc_info=True)
         return None
@@ -1669,7 +1681,8 @@ def maybe_pull_skills() -> Optional[Dict[str, Any]]:
             return None  # feature off for this instance (HERMES_SYNC_ENABLED)
         if not resolve_sync_base_url():
             return None
-        return pull_skills(identity=identity)
+        with sync_operation():
+            return pull_skills(identity=identity)
     except Exception as e:
         logger.debug("skills_sync_client: maybe_pull_skills failed: %s", e, exc_info=True)
         return None

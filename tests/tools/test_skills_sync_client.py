@@ -16,12 +16,106 @@ in-memory object store + ref table. No live server, no network.
 import hashlib
 import json
 import threading
+from contextlib import contextmanager
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 
 import pytest
 
 import tools.skills_sync_client as ssc
+
+
+def test_sync_operation_serializes_concurrent_callers():
+    first_entered = threading.Event()
+    release_first = threading.Event()
+    second_attempting = threading.Event()
+    second_entered = threading.Event()
+
+    def first():
+        with ssc.sync_operation():
+            first_entered.set()
+            assert release_first.wait(timeout=1)
+
+    def second():
+        assert first_entered.wait(timeout=1)
+        second_attempting.set()
+        with ssc.sync_operation():
+            second_entered.set()
+
+    first_thread = threading.Thread(target=first)
+    second_thread = threading.Thread(target=second)
+    first_thread.start()
+    second_thread.start()
+
+    assert first_entered.wait(timeout=1)
+    assert second_attempting.wait(timeout=1)
+    assert not second_entered.wait(timeout=0.05)
+    release_first.set()
+    first_thread.join(timeout=1)
+    second_thread.join(timeout=1)
+
+    assert not first_thread.is_alive()
+    assert not second_thread.is_alive()
+    assert second_entered.is_set()
+
+
+def test_maybe_pull_holds_sync_operation_lock(monkeypatch):
+    events = []
+
+    @contextmanager
+    def recording_operation():
+        events.append("enter")
+        yield
+        events.append("exit")
+
+    def pull_skills(*, identity):
+        assert events == ["enter"]
+        return {"ok": True, "owner": identity["owner"]}
+
+    monkeypatch.setattr(ssc, "sync_operation", recording_operation)
+    monkeypatch.setattr(
+        ssc,
+        "resolve_identity",
+        lambda: {"owner": "owner-1", "access_allowed": True},
+    )
+    monkeypatch.setattr(ssc, "sync_feature_enabled", lambda: True)
+    monkeypatch.setattr(ssc, "resolve_sync_base_url", lambda: "https://sync.test")
+    monkeypatch.setattr(ssc, "pull_skills", pull_skills)
+
+    assert ssc.maybe_pull_skills() == {"ok": True, "owner": "owner-1"}
+    assert events == ["enter", "exit"]
+
+
+def test_maybe_push_holds_sync_operation_lock(monkeypatch):
+    events = []
+
+    @contextmanager
+    def recording_operation():
+        events.append("enter")
+        yield
+        events.append("exit")
+
+    def push_skills(*, identity, message):
+        assert events == ["enter"]
+        return {"ok": True, "owner": identity["owner"], "message": message}
+
+    monkeypatch.setattr(ssc, "sync_operation", recording_operation)
+    monkeypatch.setattr(
+        ssc,
+        "resolve_identity",
+        lambda: {"owner": "owner-1", "access_allowed": True},
+    )
+    monkeypatch.setattr(ssc, "sync_feature_enabled", lambda: True)
+    monkeypatch.setattr(ssc, "resolve_sync_base_url", lambda: "https://sync.test")
+    monkeypatch.setattr(ssc, "list_synced_skill_names", lambda: ["my-skill"])
+    monkeypatch.setattr(ssc, "push_skills", push_skills)
+
+    assert ssc.maybe_push_skills(message="debounced") == {
+        "ok": True,
+        "owner": "owner-1",
+        "message": "debounced",
+    }
+    assert events == ["enter", "exit"]
 
 
 # ---------------------------------------------------------------------------
