@@ -1461,14 +1461,18 @@ class RelayAdapter(BasePlatformAdapter):
     ) -> Dict[str, Any]:
         """Copy ``metadata`` with the typing/status thread anchor applied. Slack's
         status line is THREAD-scoped and the typing lane's metadata carries no anchor
-        for a top-level DM, so synthesize it from the per-chat inbound-ts cache. Shared
-        by ``send_typing`` and ``stop_typing`` — the clear MUST target the same thread
-        the heartbeat set or the status sticks until Slack's timeout."""
+        for a top-level message, so synthesize it from the per-chat inbound-ts cache.
+        DMs and (P5) channels/groups alike: in flat channel mode the reply lands at
+        the root, but the status surface has nowhere else to live and Slack accepts
+        setStatus on a channel thread anchored at the trigger ts (live 2026-09-05).
+        Nothing is posted into that thread. Shared by ``send_typing`` and
+        ``stop_typing`` — the clear MUST target the same thread the heartbeat set or
+        the status sticks until Slack's timeout."""
         md = dict(metadata or {})
         if (
             not (md.get("thread_id") or md.get("thread_ts"))
             and self._platform_by_chat.get(str(chat_id)) == _SLACK
-            and self._chat_type_by_chat.get(str(chat_id)) == "dm"
+            and self._chat_type_by_chat.get(str(chat_id)) in ("dm", "channel", "group")
         ):
             anchor = self._last_inbound_ts_by_chat.get(str(chat_id))
             if anchor:

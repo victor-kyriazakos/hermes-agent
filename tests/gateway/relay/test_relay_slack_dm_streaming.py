@@ -401,3 +401,32 @@ async def test_typing_and_clear_share_one_status_anchor():
     assert anchors == ["1700.0001", "1700.0001"], (
         "the clear must target the thread the heartbeat set"
     )
+
+
+@pytest.mark.asyncio
+async def test_channel_status_anchors_on_trigger_when_flat():
+    """Flat channel mode (channel_reply_in_thread=false): the reply lands at the
+    channel root, but Slack's status line ("is thinking…") is thread-scoped and the
+    channel surface has no other status. Slack accepts assistant.threads.setStatus on
+    a channel thread anchored at the trigger ts (live 2026-09-05), so the heartbeat
+    and the clear both anchor there; nothing is posted into that thread."""
+    adapter, stub = _wire("C1", "channel", scope_id="T1")
+    adapter.config.extra["channel_reply_in_thread"] = False
+    adapter._last_inbound_ts_by_chat["C1"] = "1700.0002"
+    await adapter.send_typing("C1")
+    await adapter.stop_typing("C1")
+    typing_frames = [f for f in stub.sent if f["op"] == "typing"]
+    assert [(f["metadata"] or {}).get("thread_id") for f in typing_frames] == [
+        "1700.0002",
+        "1700.0002",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_channel_status_keeps_real_thread_anchor():
+    """A real thread anchor from metadata is never overridden by the trigger ts."""
+    adapter, stub = _wire("C1", "channel", scope_id="T1")
+    adapter._last_inbound_ts_by_chat["C1"] = "1700.0002"
+    await adapter.send_typing("C1", metadata={"thread_id": "1600.0009"})
+    frame = [f for f in stub.sent if f["op"] == "typing"][0]
+    assert frame["metadata"]["thread_id"] == "1600.0009"
