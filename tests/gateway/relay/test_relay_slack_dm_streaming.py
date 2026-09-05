@@ -430,3 +430,32 @@ async def test_channel_status_keeps_real_thread_anchor():
     await adapter.send_typing("C1", metadata={"thread_id": "1600.0009"})
     frame = [f for f in stub.sent if f["op"] == "typing"][0]
     assert frame["metadata"]["thread_id"] == "1600.0009"
+
+
+@pytest.mark.asyncio
+async def test_back_to_back_turns_clear_every_status_anchor():
+    """Agent-to-agent tagging (live 2026-09-05): turn 1 sets "is thinking…" on
+    anchor A; a peer's reply arrives mid-turn and moves the per-chat trigger ts to
+    B; turn 1's stop_typing must still clear A (and not leave it stuck until
+    Slack's timeout). The clear fans out to every anchor a status was set on."""
+    adapter, stub = _wire("C1", "channel", scope_id="T1")
+    adapter.config.extra["channel_reply_in_thread"] = False
+    adapter._last_inbound_ts_by_chat["C1"] = "1700.0001"
+    await adapter.send_typing("C1")
+    # A second inbound (the peer's message) advances the synthetic anchor while
+    # turn 1 is still running.
+    adapter._last_inbound_ts_by_chat["C1"] = "1700.0002"
+    await adapter.send_typing("C1")
+    await adapter.stop_typing("C1")
+    frames = [f for f in stub.sent if f["op"] == "typing"]
+    sets = [(f["metadata"] or {}).get("thread_id") for f in frames if f.get("content") != ""]
+    clears = sorted((f["metadata"] or {}).get("thread_id") for f in frames if f.get("content") == "")
+    assert sets == ["1700.0001", "1700.0002"]
+    assert clears == ["1700.0001", "1700.0002"], "the older anchor must be cleared too"
+    # A later turn starts from a clean slate: no stale anchors are re-cleared.
+    stub.sent.clear()
+    adapter._last_inbound_ts_by_chat["C1"] = "1700.0003"
+    await adapter.send_typing("C1")
+    await adapter.stop_typing("C1")
+    clears2 = [(f["metadata"] or {}).get("thread_id") for f in stub.sent if f["op"] == "typing" and f.get("content") == ""]
+    assert clears2 == ["1700.0003"]

@@ -117,6 +117,12 @@ class RelayAdapter(BasePlatformAdapter):
         # chat_id -> last triggering Slack message ts (typing/status lane's
         # synthetic thread anchor in thread-per-message mode).
         self._last_inbound_ts_by_chat: Dict[str, str] = {}
+        # chat_id -> thread anchors that currently carry a LIVE status line (set by
+        # send_typing, cleared by stop_typing). Back-to-back turns in one channel
+        # (agent-to-agent tagging, 2026-09-05) advance _last_inbound_ts_by_chat
+        # while turn 1 is still running; turn 1's clear then resolved to turn 2's
+        # anchor and turn 1's "is thinking…" stuck until Slack's timeout.
+        self._live_status_anchors_by_chat: Dict[str, set] = {}
         # chat_id -> UNDERLYING platform ("discord", ...): one adapter fronts N
         # platforms on one WS and a reply must egress through the platform the
         # inbound came from. Empty for a single-platform gateway (connector default).
@@ -1541,7 +1547,11 @@ class RelayAdapter(BasePlatformAdapter):
         # connector uses its default heartbeat. NEVER send empty-string content here:
         # on Slack that is the CLEAR request.
         phrase = getattr(self, "_status_text", {}).get(str(chat_id))
-        await self._typing_frame(chat_id, metadata, str(phrase) if phrase else None, "send_typing")
+        md = self._with_status_thread_anchor(chat_id, metadata)
+        anchor = md.get("thread_id") or md.get("thread_ts")
+        if anchor and self._platform_by_chat.get(str(chat_id)) == _SLACK:
+            self._live_status_anchors_by_chat.setdefault(str(chat_id), set()).add(str(anchor))
+        await self._typing_frame(chat_id, md, str(phrase) if phrase else None, "send_typing")
 
     async def stop_typing(self, chat_id: str, metadata: Optional[Dict[str, Any]] = None) -> None:
         """Forward an explicit typing/status clear (empty ``content``) — Slack only:
@@ -1551,7 +1561,22 @@ class RelayAdapter(BasePlatformAdapter):
         connector first."""
         if self._transport is None or self._platform_by_chat.get(str(chat_id)) != _SLACK:
             return
-        await self._typing_frame(chat_id, metadata, "", "stop_typing")
+        md = self._with_status_thread_anchor(chat_id, metadata)
+        # Clear EVERY anchor this chat set a status on, not only the one the cache
+        # resolves to now: a newer inbound may have moved the synthetic anchor
+        # under a still-running turn (see _live_status_anchors_by_chat).
+        anchors = self._live_status_anchors_by_chat.pop(str(chat_id), set())
+        current = md.get("thread_id") or md.get("thread_ts")
+        if current:
+            anchors.add(str(current))
+        if not anchors:
+            await self._typing_frame(chat_id, md, "", "stop_typing")
+            return
+        for anchor in sorted(anchors):
+            per = dict(md)
+            per.pop("thread_ts", None)
+            per["thread_id"] = anchor
+            await self._typing_frame(chat_id, per, "", "stop_typing")
 
     async def _typing_frame(
         self, chat_id: str, metadata: Optional[Dict[str, Any]], content: Optional[str], lane: str
