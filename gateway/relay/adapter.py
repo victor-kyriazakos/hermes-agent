@@ -42,6 +42,10 @@ _RELAY_REVOCATION_MONITOR_TEARDOWN_TIMEOUT_S = 1.0
 # and markdown links. Permissive on purpose — a false positive costs one fresh
 # (non-edited) final; a false negative silently loses the preview.
 _URL_RE = re.compile(r"https?://|<https?:|\]\(https?:")
+# A Slack user token ``<@U…>`` or a prose handle ``@name`` not glued to a word
+# character (emails). The connector rewrites roster names to tokens on egress,
+# so the gateway must treat both spellings as a peer address.
+_SLACK_MENTION_RE = re.compile(r"<@[UW][A-Z0-9]+>|(?<![\w<@])@[A-Za-z0-9][A-Za-z0-9_-]*")
 
 # Already-answered prompt ids to remember so a duplicate answer (double tap or
 # connector redelivery) reads as a repeat, not a stale prompt.
@@ -259,6 +263,18 @@ class RelayAdapter(BasePlatformAdapter):
             platform = metadata.get("platform")
         if platform is None:
             platform = self.descriptor.platform
+        if platform != "slack":
+            return False
+        # P5 peer addressing: Slack notifies OTHER apps only for new posts. A
+        # ``chat.update`` that introduces ``<@Upeer>`` reaches them as
+        # ``message_changed``, which no connector treats as a message, so a
+        # streamed final that addresses a peer must be a fresh post. Channels
+        # and groups only: a DM has no peer to notify.
+        chat_type = self._chat_type_by_chat.get(str(chat_id)) if chat_id is not None else None
+        if chat_type is None and isinstance(metadata, dict):
+            chat_type = metadata.get("chat_type")
+        if chat_type in ("channel", "group") and _SLACK_MENTION_RE.search(content or ""):
+            return True
         hints = self._slack_unfurl_hints(platform)
         return bool(hints) and any(v is True for v in hints.values()) and bool(_URL_RE.search(content or ""))
 
