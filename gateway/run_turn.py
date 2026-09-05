@@ -2777,11 +2777,16 @@ class GatewayTurnMixin:
                 if is_buzz:
                     _progress_reply_in_thread = getattr(_adapter, "_reply_to_mode", "first") != "off"
                 else:
-                    # Relay lane: the adapter owns mode resolution; native lane: flat extra key.
+                    # Relay lane: the adapter owns mode resolution PER CHAT TYPE (DM knob vs
+                    # channel knob, P4) so progress and final agree; native lane: flat extra key.
+                    _mode_for_chat = getattr(_adapter, "_effective_reply_in_thread_for_chat", None)
                     _mode_fn = getattr(_adapter, "_effective_reply_in_thread", None)
-                    _progress_reply_in_thread = bool(
-                        _mode_fn() if callable(_mode_fn) else _adapter.config.extra.get("reply_in_thread", True)
-                    )
+                    if callable(_mode_for_chat):
+                        _progress_reply_in_thread = bool(_mode_for_chat(str(source.chat_id)))
+                    else:
+                        _progress_reply_in_thread = bool(
+                            _mode_fn() if callable(_mode_fn) else _adapter.config.extra.get("reply_in_thread", True)
+                        )
             except Exception:
                 _progress_reply_in_thread = True
         _progress_thread_id = _resolve_progress_thread_id(

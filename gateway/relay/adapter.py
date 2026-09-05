@@ -785,6 +785,23 @@ class RelayAdapter(BasePlatformAdapter):
         """Resolve the thread-per-message vs flat-DM mode for fronted Slack."""
         return self._slack_flag("reply_in_thread", True)
 
+    def _effective_channel_reply_in_thread(self) -> bool:
+        """Where a CHANNEL/group reply lands: threaded under the triggering message
+        (default, native parity) or at the channel root. Independent of the DM knob
+        ``reply_in_thread`` so flat DMs + threaded channels (or the reverse) are
+        both expressible. ``platforms.relay.extra.slack.channel_reply_in_thread``."""
+        return self._slack_flag("channel_reply_in_thread", True)
+
+    def _effective_reply_in_thread_for_chat(self, chat_id: str) -> bool:
+        """The effective threading mode for ONE chat, by its captured chat_type: DMs
+        follow ``reply_in_thread``, channels/groups follow ``channel_reply_in_thread``.
+        run.py's progress lane and the final-send anchor both resolve through here so
+        the two lanes never disagree (2026-09-05 live: flat progress + threaded final)."""
+        chat_type = self._chat_type_by_chat.get(str(chat_id))
+        if chat_type in ("channel", "group"):
+            return self._effective_channel_reply_in_thread()
+        return self._effective_reply_in_thread()
+
     def _dm_top_level_threads_as_sessions(self) -> bool:
         """Native-parity escape hatch: per-message DM sessions on/off. Default True:
         in thread-per-message mode each top-level DM message keys its own session.
@@ -1379,12 +1396,14 @@ class RelayAdapter(BasePlatformAdapter):
         md = metadata or {}
         if (
             self._platform_by_chat.get(str(chat_id)) != _SLACK
-            or self._chat_type_by_chat.get(str(chat_id)) != "dm"
+            or self._chat_type_by_chat.get(str(chat_id)) not in ("dm", "channel", "group")
             or md.get("thread_id")
             or md.get("thread_ts")
         ):
             return reply_to
-        return reply_to if self._effective_reply_in_thread() else None
+        # DM: ``reply_in_thread``; channel/group: ``channel_reply_in_thread`` (P4).
+        # A real thread (thread_id/thread_ts in metadata) was already kept above.
+        return reply_to if self._effective_reply_in_thread_for_chat(chat_id) else None
 
     def _apply_slack_thread_anchor(
         self,
