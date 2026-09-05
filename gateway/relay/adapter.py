@@ -46,6 +46,9 @@ _URL_RE = re.compile(r"https?://|<https?:|\]\(https?:")
 # character (emails). The connector rewrites roster names to tokens on egress,
 # so the gateway must treat both spellings as a peer address.
 _SLACK_MENTION_RE = re.compile(r"<@[UW][A-Z0-9]+>|(?<![\w<@])@[A-Za-z0-9][A-Za-z0-9_-]*")
+# Chat types where a peer app can be listening: a peer-addressed streamed final
+# must be a fresh post there. Thread replies carry chat_type "thread" (Salt B8.2).
+_PEER_NOTIFY_CHAT_TYPES = frozenset({"channel", "group", "thread"})
 
 # Already-answered prompt ids to remember so a duplicate answer (double tap or
 # connector redelivery) reads as a repeat, not a stale prompt.
@@ -268,12 +271,14 @@ class RelayAdapter(BasePlatformAdapter):
         # P5 peer addressing: Slack notifies OTHER apps only for new posts. A
         # ``chat.update`` that introduces ``<@Upeer>`` reaches them as
         # ``message_changed``, which no connector treats as a message, so a
-        # streamed final that addresses a peer must be a fresh post. Channels
-        # and groups only: a DM has no peer to notify.
+        # streamed final that addresses a peer must be a fresh post. Channels,
+        # groups AND thread replies (a genuine Slack thread reply arrives as
+        # ``chat_type == "thread"``; the fresh send keeps its thread_id anchor,
+        # so placement is unchanged — Salt B8.2). A DM has no peer to notify.
         chat_type = self._chat_type_by_chat.get(str(chat_id)) if chat_id is not None else None
         if chat_type is None and isinstance(metadata, dict):
             chat_type = metadata.get("chat_type")
-        if chat_type in ("channel", "group") and _SLACK_MENTION_RE.search(content or ""):
+        if chat_type in _PEER_NOTIFY_CHAT_TYPES and _SLACK_MENTION_RE.search(content or ""):
             return True
         hints = self._slack_unfurl_hints(platform)
         return bool(hints) and any(v is True for v in hints.values()) and bool(_URL_RE.search(content or ""))
