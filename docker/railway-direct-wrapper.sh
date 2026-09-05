@@ -187,7 +187,10 @@ fi
 # Boxes with HERMES_STAGING_TRAJECTORIES=1 (Carol) also write full ATOF
 # event streams + ATIF trajectories to the durable volume as the deep
 # audit evidence tier.
-/command/s6-setuidgid hermes /opt/hermes/.venv/bin/hermes plugins enable observability/nemo_relay
+# main (config schema 38+) removed the bundled observability/nemo_relay plugin:
+# Relay lifecycle lives in the agent core and activates ONLY through
+# HERMES_NEMO_RELAY_PLUGINS_TOML (exported below). No `plugins enable` here.
+# HERMES_STAGING_DISABLE_NEMO_RELAY=1 boots without the exporter (probe guard).
 instance_hash="$(/command/s6-setuidgid hermes /opt/hermes/.venv/bin/python - <<'PYEOF'
 import hashlib
 from hermes_cli.config import load_config
@@ -255,9 +258,14 @@ agent_version = "$(/opt/hermes/.venv/bin/hermes --version 2>/dev/null | head -1 
 EOFTOML
 fi
 chown -R hermes:hermes "$relay_dir"
-export HERMES_NEMO_RELAY_PLUGINS_TOML="$relay_dir/plugins.toml"
-printf 'relay_telemetry plugins_toml=%s instance=%s trajectories=%s\n' \
-  "$HERMES_NEMO_RELAY_PLUGINS_TOML" "$instance_hash" "${HERMES_STAGING_TRAJECTORIES:-0}"
+if [ "${HERMES_STAGING_DISABLE_NEMO_RELAY:-0}" = "1" ]; then
+  unset HERMES_NEMO_RELAY_PLUGINS_TOML
+  printf 'relay_telemetry DISABLED by HERMES_STAGING_DISABLE_NEMO_RELAY probe guard\n'
+else
+  export HERMES_NEMO_RELAY_PLUGINS_TOML="$relay_dir/plugins.toml"
+  printf 'relay_telemetry plugins_toml=%s instance=%s trajectories=%s\n' \
+    "$HERMES_NEMO_RELAY_PLUGINS_TOML" "$instance_hash" "${HERMES_STAGING_TRAJECTORIES:-0}"
+fi
 # ---------- END RELAY TELEMETRY ----------
 
 cd "$home"
