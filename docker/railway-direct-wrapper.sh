@@ -218,6 +218,9 @@ fi
 # Relay lifecycle lives in the agent core and activates ONLY through
 # HERMES_NEMO_RELAY_PLUGINS_TOML (exported below). No `plugins enable` here.
 # HERMES_STAGING_DISABLE_NEMO_RELAY=1 boots without the exporter (probe guard).
+# Volumes provisioned by the pre-main wrapper still list the removed plugin in
+# plugins.enabled; drop it so boot does not warn on every start.
+/command/s6-setuidgid hermes /opt/hermes/.venv/bin/hermes plugins disable observability/nemo_relay >/dev/null 2>&1 || true
 instance_hash="$(/command/s6-setuidgid hermes /opt/hermes/.venv/bin/python - <<'PYEOF'
 import hashlib
 from hermes_cli.config import load_config
