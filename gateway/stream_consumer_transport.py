@@ -437,15 +437,15 @@ class StreamTransportMixin:
 
     async def _edit_existing(self, text: str, *, finalize: bool, is_turn_final: bool) -> bool:
         """Edit the live preview (or replace it via fresh-final when finalizing)."""
-        # REQUIRES_EDIT_FINALIZE adapters need the finalize=True edit even when
-        # unchanged; everyone else short-circuits.
-        if text == self._last_sent_text and not (finalize and self._adapter_requires_finalize):
-            return True
         # Fresh-final: replace a long-lived preview with a fresh message, or whenever
-        # the adapter prefers it (Telegram's send path renders richer markdown).  An
+        # the adapter prefers it (Telegram's send path renders richer markdown; a
+        # Slack final that addresses a peer must be a NEW post to notify it).  An
         # explicit hook returning False must NOT be overridden by the time threshold
         # (delete is best-effort; both messages would stay on screen).  Check the
         # CLASS (MagicMock auto-creates attrs) plus instance __dict__ (test doubles).
+        # Evaluated BEFORE the unchanged-text shortcut: a cursor-free preview that
+        # already holds the complete final text is still only an edit-lane preview,
+        # and skipping here left it as an un-notifying, unlinked message (Salt B8.3).
         has_prefers_hook = (
             hasattr(type(self.adapter), "prefers_fresh_final_streaming")
             or "prefers_fresh_final_streaming" in getattr(self.adapter, "__dict__", {}))
@@ -453,6 +453,10 @@ class StreamTransportMixin:
         if finalize and (
             prefers_fresh or (not has_prefers_hook and self._should_send_fresh_final())
         ) and await self._try_fresh_final(text, is_turn_final=is_turn_final):
+            return True
+        # REQUIRES_EDIT_FINALIZE adapters need the finalize=True edit even when
+        # unchanged; everyone else short-circuits.
+        if text == self._last_sent_text and not (finalize and self._adapter_requires_finalize):
             return True
         result = await self._edit_message(message_id=self._message_id, content=text,
                                           finalize=finalize)
