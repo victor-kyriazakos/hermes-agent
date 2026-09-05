@@ -85,6 +85,48 @@ printf '%s\n' 'hermes_runtime_cli_preflight=passed'
 /command/s6-setuidgid hermes /opt/hermes/.venv/bin/hermes config set monitoring.export.otlp.enabled true
 /command/s6-setuidgid hermes /opt/hermes/.venv/bin/hermes config set monitoring.export.otlp.endpoint http://otel-collector.railway.internal:4318/v1/traces
 /command/s6-setuidgid hermes /opt/hermes/.venv/bin/python /opt/hermes/docker/ensure_platform_toolset.py slack terminal
+# ---------------------------------------------------------------------------
+# Baked profiles (4x4x1 pilot, PRD v3 §4.3): the connector routes
+# `carol@C2 -> inst-dmitry:review` by stamping source.profile; this gateway
+# must SERVE that profile or the turn is dropped fail-closed. Profiles are
+# declared by HERMES_STAGING_PROFILES (comma list, default none). Each is
+# created once (idempotent: skipped when present) as a clone of the default
+# profile's config + .env, so model and credentials follow, then given its
+# own SOUL. Multiplexing is switched on only when at least one is declared.
+# Interim: profiles are baked here, not managed. Managed profiles (Coatue's
+# pattern) belong next to skill sync; tracked in the working page.
+# ---------------------------------------------------------------------------
+if [ -n "${HERMES_STAGING_PROFILES:-}" ]; then
+  for p in $(printf '%s' "$HERMES_STAGING_PROFILES" | tr ',' ' '); do
+    if [ -d "$home/profiles/$p" ]; then
+      printf 'baked_profile present=%s\n' "$p"
+      continue
+    fi
+    if /command/s6-setuidgid hermes /opt/hermes/.venv/bin/hermes profile create "$p" --clone >/dev/null 2>&1; then
+      # `--clone` copies config + .env and writes a template SOUL; replace the
+      # SOUL with the role for this pilot. First creation only: an operator
+      # may edit the SOUL on the volume afterwards and it must survive restarts.
+      /command/s6-setuidgid hermes sh -c "cat > '$home/profiles/$p/SOUL.md'" <<EOFSOUL
+# $p
+
+You are the **$p** profile of this agent. You share the agent's identity and
+credentials but serve a distinct role selected by the channel you were reached
+in. When asked who you are, say you are the $p profile and name the role.
+
+Role for review: a careful code and document reviewer. Lead with the single
+most important finding, then a short ordered list. Prefer questions that expose
+risk over praise. Never rewrite the author's work unasked.
+EOFSOUL
+      printf 'baked_profile created=%s soul=written\n' "$p"
+    else
+      printf 'baked_profile create FAILED=%s\n' "$p"
+    fi
+  done
+  # Verified at this SHA: writes gateway.multiplex_profiles, read by
+  # load_gateway_config(); profiles_to_serve() then lists default + baked.
+  /command/s6-setuidgid hermes /opt/hermes/.venv/bin/hermes config set gateway.multiplex_profiles true --force >/dev/null
+  printf 'baked_profiles multiplex=on set=%s\n' "$HERMES_STAGING_PROFILES"
+fi
 
 # ---------- CREDENTIAL POOL SEEDING (2026-08-10) ----------
 # Terminal/execute_code subprocesses deliberately strip provider API keys
