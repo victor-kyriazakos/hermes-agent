@@ -85,6 +85,33 @@ printf '%s\n' 'hermes_runtime_cli_preflight=passed'
 /command/s6-setuidgid hermes /opt/hermes/.venv/bin/hermes config set monitoring.export.otlp.enabled true
 /command/s6-setuidgid hermes /opt/hermes/.venv/bin/hermes config set monitoring.export.otlp.endpoint http://otel-collector.railway.internal:4318/v1/traces
 /command/s6-setuidgid hermes /opt/hermes/.venv/bin/python /opt/hermes/docker/ensure_platform_toolset.py slack terminal
+
+# ---------- RELAY SLACK CONFIG MATRIX (ported from rc5 3157deb, 2026-09-05) ----------
+# Per-box relay Slack behavior knobs (platforms.relay.extra.slack.*) from ONE
+# service var. Comma-separated k=v, keys land verbatim under
+# platforms.relay.extra.slack.<k>. Unset = shipping defaults (threaded
+# replies, per-message DM sessions). Gateway-owned, stamped per frame.
+#   HERMES_RELAY_SLACK_KNOBS="reply_in_thread=false,markdown_blocks=true"
+if [ -n "${HERMES_RELAY_SLACK_KNOBS:-}" ]; then
+  printf 'relay_slack_knobs ACTIVE: %s\n' "${HERMES_RELAY_SLACK_KNOBS}"
+  echo "${HERMES_RELAY_SLACK_KNOBS}" | tr ',' '\n' | while IFS='=' read -r k v; do
+    [ -n "$k" ] && [ -n "$v" ] && \
+      /command/s6-setuidgid hermes /opt/hermes/.venv/bin/hermes config set "platforms.relay.extra.slack.${k}" "${v}" --force >/dev/null || true
+  done
+fi
+# Relevance knobs (require_mention, free_response_channels) live on the
+# NATIVE block platforms.slack.<k>: relay_relevance_policy() reads them there
+# and declares requireAddress / freeResponseScopes to the connector at boot.
+# Setting them does NOT start the native adapter (that needs SLACK_BOT_TOKEN).
+#   HERMES_SLACK_POLICY_KNOBS="require_mention=false"
+if [ -n "${HERMES_SLACK_POLICY_KNOBS:-}" ]; then
+  printf 'slack_policy_knobs ACTIVE: %s\n' "${HERMES_SLACK_POLICY_KNOBS}"
+  echo "${HERMES_SLACK_POLICY_KNOBS}" | tr ',' '\n' | while IFS='=' read -r k v; do
+    [ -n "$k" ] && [ -n "$v" ] && \
+      /command/s6-setuidgid hermes /opt/hermes/.venv/bin/hermes config set "platforms.slack.${k}" "${v}" --force >/dev/null || true
+  done
+fi
+# ---------- END RELAY SLACK CONFIG MATRIX ----------
 # ---------------------------------------------------------------------------
 # Baked profiles (4x4x1 pilot, PRD v3 §4.3): the connector routes
 # `carol@C2 -> inst-dmitry:review` by stamping source.profile; this gateway
