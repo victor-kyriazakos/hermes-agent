@@ -225,19 +225,51 @@ def _json_post(url: str, token: str, body: dict, timeout: float):
     return urllib.request.urlopen(req, timeout=timeout)
 
 
+_TRUTHY_FLAGS = {"1", "true", "yes", "on"}
+
+
+def _coerce_flag(raw, default: bool) -> bool:
+    """Operator boolean coercion, same as ``RelayAdapter._coerce_flag``: a YAML-quoted
+    ``"false"`` must turn a flag OFF (bare ``bool()`` reads it as True)."""
+    if raw is None:
+        return default
+    return raw if isinstance(raw, bool) else str(raw).strip().lower() in _TRUTHY_FLAGS
+
+
+def _relay_platform_extra_cfg(cfg: dict, platform: str) -> dict:
+    """``platforms.relay.extra.<platform>.*`` from raw config — the SAME knob source the
+    relay adapter reads at runtime (``RelayAdapter._relay_platform_extra``), incl. the
+    ``gateway.platforms.relay`` spelling and the legacy flat-relay-extra fallback."""
+    for root in (cfg, cfg.get("gateway") or {}):
+        platforms = root.get("platforms") if isinstance(root, dict) else None
+        relay_cfg = platforms.get("relay") if isinstance(platforms, dict) else None
+        extra = relay_cfg.get("extra") if isinstance(relay_cfg, dict) else None
+        if not isinstance(extra, dict):
+            continue
+        sub = extra.get(platform)
+        return sub if isinstance(sub, dict) else extra
+    return {}
+
+
 def relay_relevance_policy(platform: Optional[str] = None) -> Optional[dict]:
     """Project a fronted platform's RELEVANCE config into the connector's generic vocabulary.
 
     The connector's relevance gate reasons over a platform-agnostic policy keyed by
     ``(tenant, platform, instanceId)``: ``requireAddress`` <- ``require_mention``,
     ``freeResponseScopes`` <- ``free_response_channels``, ``allowOtherBots`` <-
-    ``{PLATFORM}_ALLOW_BOTS`` in {"mentions","all"}. Read from the platform's config
-    block (``discord:``), falling back to the bridged top-level keys, then env.
-    ``platform`` defaults to the PRIMARY fronted platform. Returns None when relay
-    isn't configured or nothing is CONFIGURED to declare, so the connector's default
-    (mention-gated) applies. The condition is "require_mention is unset", NOT "falsy":
-    an EXPLICIT ``require_mention: false`` is a non-default choice that MUST be
-    declared or the connector would mention-gate an agent configured to free-respond.
+    ``{PLATFORM}_ALLOW_BOTS`` in {"mentions","all"}. ``platform`` defaults to the
+    PRIMARY fronted platform. Returns None only when relay isn't fronting a platform.
+
+    Precedence for ``require_mention`` (first hit wins):
+    ``platforms.relay.extra.<platform>.require_mention`` (the canonical knob source the
+    relay adapter itself reads) -> the native platform block (``<platform>:``,
+    ``gateway.platforms.<platform>``, ``platforms.<platform>``) -> top-level
+    ``require_mention``. UNSET resolves to ``requireAddress=True``: the connector maps a
+    missing/false ``requireAddress`` to "admit unaddressed traffic", so only an EXPLICIT
+    ``false`` may relax mention gating. ``allowOtherBots`` is independent — enabling bot
+    authors NEVER changes the address requirement (Salt B9). A fully unconfigured
+    platform still yields the default policy so boot can publish an explicit reset
+    (a previously permissive connector row must not survive config removal).
     """
     if platform is None:
         platform, _bot_id = relay_platform_identity()
@@ -248,6 +280,8 @@ def relay_relevance_policy(platform: Optional[str] = None) -> Optional[dict]:
     free_response: list[str] = []
     try:
         cfg = _load_cfg()
+        relay_extra = _relay_platform_extra_cfg(cfg, platform)
+
         # Platform block lookup order: top-level ``<platform>:``, then
         # ``gateway.platforms.<platform>``, then ``platforms.<platform>``.
         def _candidates():
@@ -258,12 +292,16 @@ def relay_relevance_policy(platform: Optional[str] = None) -> Optional[dict]:
 
         plat_cfg = next((c for c in _candidates() if isinstance(c, dict)), {})
 
-        if "require_mention" in plat_cfg:
+        if relay_extra.get("require_mention") is not None:
+            require_mention = relay_extra.get("require_mention")
+        elif plat_cfg.get("require_mention") is not None:
             require_mention = plat_cfg.get("require_mention")
         elif cfg.get("require_mention") is not None:
             require_mention = cfg.get("require_mention")
 
-        frc = plat_cfg.get("free_response_channels")
+        frc = relay_extra.get("free_response_channels")
+        if frc is None:
+            frc = plat_cfg.get("free_response_channels")
         if frc is None:
             frc = cfg.get("free_response_channels")
         if isinstance(frc, (list, tuple)):
@@ -277,11 +315,10 @@ def relay_relevance_policy(platform: Optional[str] = None) -> Optional[dict]:
     allow_bots_env = os.environ.get(f"{platform.upper()}_ALLOW_BOTS", "").lower().strip()
     allow_other_bots = allow_bots_env in {"mentions", "all"}
 
-    if require_mention is None and not free_response and not allow_other_bots:
-        return None
     return {
         "platform": platform,
-        "requireAddress": bool(require_mention),
+        # Default TRUE; only an explicit false relaxes mention gating.
+        "requireAddress": _coerce_flag(require_mention, True),
         "freeResponseScopes": free_response,
         "allowOtherBots": allow_other_bots,
     }
@@ -536,8 +573,10 @@ def send_relay_policy() -> bool:
     at boot AFTER the per-gateway secret is resolved. The connector enforces it on
     delivery, so the SAME mention-gating / free-response / allow-bots behavior the
     agent applies directly also governs relay delivery, and excluded traffic never
-    wakes a scaled-to-zero agent. Re-declared every boot (idempotent full replace); a
-    platform with nothing non-default is skipped; one failed POST doesn't block the
+    wakes a scaled-to-zero agent. Re-declared every boot (idempotent full replace) —
+    INCLUDING a platform with nothing configured, which publishes the default
+    (mention-gated) policy so a previously permissive row cannot outlive its config
+    (Salt B9); one failed POST doesn't block the
     others. NEVER raises / blocks boot: relevance is an optimization layered on the
     authorization gate, so a failure just leaves the connector's prior policy.
     Returns True iff the connector accepted at least one policy (HTTP 200)."""
@@ -563,7 +602,7 @@ def send_relay_policy() -> bool:
     for platform, _bot_id in relay_platform_identities():
         policy = relay_relevance_policy(platform)
         if policy is None:
-            continue
+            continue  # only the bare "relay" pseudo-platform / no identity
         try:
             status = _post_policy(policy_url=policy_url, token=token, policy=policy)
         except Exception as exc:  # noqa: BLE001 - boot must survive a policy-declare failure
