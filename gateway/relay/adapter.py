@@ -537,6 +537,25 @@ class RelayAdapter(BasePlatformAdapter):
             return SendResult(success=True, message_id=str(result.get("message_id") or "") or None)
         return SendResult(success=False, error=str(result.get("error") or "draft seal failed"))
 
+    # Wire-frame metadata key marking a send as interim (commentary, tail flush,
+    # lifecycle ack) rather than the turn-final. Shared vocabulary with the
+    # connector: its Slack peer-mention wrapper skips ``<@Upeer>`` resolution on
+    # frames carrying it, so a peer named in commentary is pinged ONLY by the
+    # notifying final post (Salt B8.1). Absent (never ``false``) on finals so old
+    # connectors see unchanged frames.
+    INTERIM_WIRE_KEY = "gg_interim"
+
+    @classmethod
+    def _mark_interim_on_wire(cls, metadata: Dict[str, Any], interim: bool) -> None:
+        """Stamp ``INTERIM_WIRE_KEY`` on an interim egress frame's metadata (in place).
+        The gateway-internal ``_interim_send`` flag never reaches the wire; this is
+        its explicit, connector-facing counterpart."""
+        if interim:
+            metadata[cls.INTERIM_WIRE_KEY] = True
+        else:
+            # A caller can't smuggle a false-final past the connector by pre-stamping.
+            metadata.pop(cls.INTERIM_WIRE_KEY, None)
+
     async def _absorb_into_open_draft(
         self, chat_id: str, content: str, metadata: Dict[str, Any], interim: bool
     ) -> Optional[SendResult]:
@@ -1224,8 +1243,10 @@ class RelayAdapter(BasePlatformAdapter):
         if not self.fronts_platform(platform_value):
             return SendResult(success=False, error=f"relay does not front platform {platform_value}")
         _sfp_metadata = dict(metadata or {})
-        # Gateway-internal interim marker (see send()): strip before the wire.
+        # Gateway-internal interim marker (see send()): strip before the wire,
+        # forwarded as ``gg_interim``.
         _interim = bool(_sfp_metadata.pop("_interim_send", False))
+        self._mark_interim_on_wire(_sfp_metadata, _interim)
         # The delivery resolver calls THIS method directly, bypassing send() — an
         # open native stream must absorb the turn-final here too.
         seal = await self._absorb_into_open_draft(chat_id, content, _sfp_metadata, _interim)
@@ -1314,8 +1335,10 @@ class RelayAdapter(BasePlatformAdapter):
         # Consumer-declared interim send (commentary, tail flush): NOT the turn-final,
         # so it must never trigger seal-interception (sealing the live stream with
         # interim text orphans the true final into a plain duplicate).
-        # Gateway-internal marker; strip before the wire.
+        # Gateway-internal marker; strip before the wire, but forward the fact as
+        # ``gg_interim`` (see _mark_interim_on_wire).
         _interim = bool(send_metadata.pop("_interim_send", False))
+        self._mark_interim_on_wire(send_metadata, _interim)
         # Seal-interception is checked BEFORE the explicit-platform branch: an open
         # stream absorbs the turn-final whichever door it arrives through.
         seal = await self._absorb_into_open_draft(chat_id, content, send_metadata, _interim)
