@@ -70,6 +70,23 @@ def test_outer_nonstream_attempt_correlates_in_worker(capture):
         assert 'instructions' not in json.dumps(inner['data'])
 
 
+@pytest.mark.parametrize('tools', [None, [{'type': 'function', 'name': 'native_tool',
+    'parameters': {'type': 'object'}, 'strict': True}]])
+def test_physical_capture_preserves_native_responses_request(capture, tools):
+    events, lease, _ = capture
+    request = {'model': 'synthetic', 'input': 'hello', 'tools': tools,
+               'timeout': 10, 'extra_headers': {'x-test': 'header-only'}}
+    sent = []
+    invocation.execute(request, lambda body: sent.append(body) or {'output': []},
+        metadata={'api_mode': 'codex_responses'}, name='openai',
+        model_name='synthetic', session_id=lease.session_id)
+    starts = [e for e in flush(events, 'openai.responses') if e['scope_category'] == 'start']
+    assert len(starts) == 1
+    assert starts[0]['data']['content'] == {k: v for k, v in sent[0].items()
+                                          if k not in {'timeout', 'extra_headers'}}
+    assert sent[0] is request
+
+
 class Accumulator:
     def __init__(self):
         self.chunks = []

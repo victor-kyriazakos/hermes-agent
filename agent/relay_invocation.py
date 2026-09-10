@@ -39,6 +39,14 @@ def capture(request, *, metadata, name, model_name, session_id=None):
                 'hermes.llm.invocation_id': str(uuid4())}
     attempt = relay_llm._ManagedAttempt(runtime, session, parent, request, metadata,
                                        name=name, model_name=model_name)
+    # This is observation of the final native request, not a codec input.
+    # Preserve provider tool shapes (including explicit null) while keeping SDK
+    # controls out of content and headers in the sanitizer-aware channel.
+    body = relay_llm._jsonable_dict(request)
+    body.pop('timeout', None)
+    body.pop('extra_headers', None)
+    attempt.relay_request = runtime.relay.LLMRequest(
+        dict(request.get('extra_headers') or {}), body)
     with capture_llm(attempt, True) as record:
         yield record
 
