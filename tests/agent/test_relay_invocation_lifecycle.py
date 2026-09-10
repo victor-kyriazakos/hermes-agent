@@ -10,7 +10,8 @@ from agent import relay_invocation as invocation, turn_api_call
 from tests.agent.test_relay_passive_capture import capture, flush, relay
 
 
-def test_outer_nonstream_attempt_correlates_in_worker(capture):
+@pytest.mark.parametrize('api_mode', ['anthropic_messages', 'chat_completions'])
+def test_outer_nonstream_attempt_correlates_in_worker(capture, api_mode):
     from agent.client_lifecycle import ClientLifecycleMixin
     from agent.chat_completion_helpers import _context_thread_target
     events, lease, _ = capture
@@ -20,16 +21,21 @@ def test_outer_nonstream_attempt_correlates_in_worker(capture):
     def create(**kwargs):
         calls.append(kwargs)
         raise failure
-    client = SimpleNamespace(messages=SimpleNamespace(create=create))
+    client = SimpleNamespace(messages=SimpleNamespace(create=create),
+        chat=SimpleNamespace(completions=SimpleNamespace(create=create)))
     agent = SimpleNamespace(session_id=lease.session_id, provider='anthropic', model='synthetic',
-        api_mode='anthropic_messages', _current_api_request_id='stale-shared-value',
+        api_mode=api_mode, _current_api_request_id='stale-shared-value',
         _disable_streaming=True, _capture_anthropic_response_headers=lambda *a: None,
         base_url='https://example.test', platform='test', _has_pending_redirect=lambda: False)
     def worker_call(request):
         errors = []
         def run():
             try:
-                ClientLifecycleMixin._anthropic_messages_create(agent, request, client=client)
+                if api_mode == 'anthropic_messages':
+                    ClientLifecycleMixin._anthropic_messages_create(agent, request, client=client)
+                else:
+                    from agent.chat_completion_helpers import _dispatch_nonstreaming_api_request
+                    _dispatch_nonstreaming_api_request(agent, request, make_client=lambda *a: client)
             except BaseException as exc:
                 errors.append(exc)
         worker = Thread(target=_context_thread_target(run))
@@ -56,8 +62,9 @@ def test_outer_nonstream_attempt_correlates_in_worker(capture):
     finally:
         relay.intercepts.deregister_llm_execution('invocation-lifecycle')
     assert len(policy) == len(calls) == 2
-    assert all('instructions' not in request for request in calls)
-    starts = [e for e in flush(events, 'anthropic.messages') if e['scope_category'] == 'start']
+    assert all(('instructions' not in request) if api_mode == 'anthropic_messages' else True for request in calls)
+    operation = 'anthropic.messages' if api_mode == 'anthropic_messages' else 'openai.chat_completions'
+    starts = [e for e in flush(events, operation) if e['scope_category'] == 'start']
     managed = [e for e in starts if e['metadata'].get('hermes.llm.phase') == 'managed_attempt']
     physical = [e for e in starts if e['metadata'].get('hermes.llm.phase') == 'authorized_invocation']
     assert len(managed) == len(physical) == 2
@@ -67,7 +74,10 @@ def test_outer_nonstream_attempt_correlates_in_worker(capture):
         assert inner['metadata']['api_request_id'] == 'actual-request'
         assert inner['metadata']['retry_count'] == outer['metadata']['retry_count']
         assert 'authorized' in json.dumps(inner['data'])
-        assert 'instructions' not in json.dumps(inner['data'])
+        if api_mode == 'anthropic_messages':
+            assert 'instructions' not in json.dumps(inner['data'])
+        assert inner['data']['content'] == {k: v for k, v in calls[physical.index(inner)].items()
+                                          if k not in {'timeout', 'extra_headers'}}
 
 
 @pytest.mark.parametrize('tools', [None, [{'type': 'function', 'name': 'native_tool',

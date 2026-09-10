@@ -703,7 +703,15 @@ def _dispatch_nonstreaming_api_request(agent, api_kwargs: dict, *, make_client):
         if not callable(getattr(_completions, "prepare", None)):
             api_kwargs.pop("_moa_prepared_request", None)
         return agent.client.chat.completions.create(**api_kwargs)
-    return make_client("chat_completion_request").chat.completions.create(**api_kwargs)
+    request_client = make_client("chat_completion_request")
+    from agent import relay_invocation
+    return relay_invocation.execute(
+        api_kwargs, lambda request: request_client.chat.completions.create(**request),
+        session_id=str(getattr(agent, "session_id", "") or ""),
+        name=str(getattr(agent, "provider", "provider") or "provider"),
+        model_name=str(getattr(agent, "model", "") or ""),
+        metadata=relay_invocation.current_attempt_metadata({"api_mode": "chat_completions"}),
+    )
 
 
 def should_use_direct_api_call(agent) -> bool:
