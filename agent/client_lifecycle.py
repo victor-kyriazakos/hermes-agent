@@ -958,11 +958,35 @@ class ClientLifecycleMixin:
             self._try_refresh_anthropic_client_credentials()
         # Strips Responses-only kwargs that leak in under an api_mode-flip race.
         from agent.anthropic_adapter import create_anthropic_message
+        from agent.anthropic_adapter import sanitize_anthropic_kwargs
+        from agent.chat_completion_helpers import _relay_stream_identity, _relay_stream_metadata
+        from agent import relay_llm, relay_invocation
+        identity = _relay_stream_identity(self, "anthropic")
+        metadata = relay_invocation.current_attempt_metadata(_relay_stream_metadata(self, "anthropic_messages"))
+
+        def physical_attempt(request, callback):
+            def authorized(final):
+                final = dict(final)
+                sanitize_anthropic_kwargs(final, log_prefix=getattr(self, "log_prefix", ""))
+                return relay_invocation.execute(final, callback, **identity, metadata=metadata)
+            return relay_invocation.managed_execute(request, authorized, **identity, metadata=metadata,
+                                     defer_logical_completion=True)
+
+        def physical_stream(request, factory, finalizer):
+            accumulator = relay_llm.AnthropicStreamAccumulator()
+            def authorized(final):
+                final = dict(final)
+                sanitize_anthropic_kwargs(final, log_prefix=getattr(self, "log_prefix", ""))
+                return relay_invocation.stream(final, factory, **identity, metadata=metadata)
+            return relay_invocation.ManagedStream(request, authorized, **identity, metadata=metadata,
+                finalizer=lambda: finalizer() or accumulator.finalize(), on_chunk=accumulator.observe,
+                defer_logical_completion=True)
         # on_response: rate-limit + credits state live in response headers, which the parsed Message drops.
         return create_anthropic_message(
             client or self._anthropic_client, api_kwargs, log_prefix=getattr(self, "log_prefix", ""),
             prefer_stream=not bool(getattr(self, "_disable_streaming", False)),
             on_response=self._capture_anthropic_response_headers,
+            physical_attempt=physical_attempt, physical_stream=physical_stream,
         )
 
     def _rebuild_anthropic_client(self) -> None:

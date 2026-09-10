@@ -32,6 +32,11 @@ class RelayChatAccumulator:
     """Rebuild a chat.completion from Relay's post-intercept chunk dicts."""
 
     def __init__(self) -> None:
+        try:
+            from nemo_relay.streaming import ChatAccumulator
+            self._capture = ChatAccumulator()
+        except ImportError:  # Stock Relay <0.9 retains the existing display-compatible path.
+            self._capture = None
         self._content: list[str] = []
         self._reasoning: list[str] = []
         self._tool_calls = _ToolCallAccumulator()
@@ -39,6 +44,9 @@ class RelayChatAccumulator:
         self._role = "assistant"
 
     def observe(self, chunk: Any) -> None:
+        if self._capture is not None:
+            self._capture.collect(chunk)
+            return
         if not isinstance(chunk, dict):
             return
         self._model = chunk.get("model") or self._model
@@ -65,6 +73,8 @@ class RelayChatAccumulator:
             self._tool_calls.feed(_tool_call_delta_view(tc_delta))
 
     def finalize(self) -> dict[str, Any]:
+        if self._capture is not None:
+            return self._capture.finalize()
         acc = self._tool_calls.materialize()
         message = {"role": self._role, "content": "".join(self._content) or None,
             "reasoning_content": "".join(self._reasoning) or None,

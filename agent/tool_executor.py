@@ -685,8 +685,13 @@ def _dispatch_authorized_once(
     elif ref.name == "skill_manage":
         agent._iters_since_skill = 0
 
+    from agent import relay_tools
+
     _advance_start_order(lambda: _begin_tool_execution(agent, ref, display_index))
-    return _run_with_activity_heartbeat(agent, ref.name, lambda: execute(ref.args))
+    return _run_with_activity_heartbeat(agent, ref.name, lambda: relay_tools.invoke_authorized(
+        ref.name, ref.args, execute,
+        session_id=str(getattr(agent, "session_id", "") or ""), tool_call_id=ref.call_id or None,
+    ))
 
 
 def _run_agent_tool_execution_middleware(

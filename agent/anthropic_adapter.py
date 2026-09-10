@@ -621,8 +621,35 @@ def _is_stream_unavailable_error(exc: Exception) -> bool:
     return is_streaming_access_denied_error(exc)
 
 
-def _stream_final_message(stream_fn, api_kwargs, log_prefix, on_stream_event, on_response):
-    """``messages.stream()`` -> final Message, ticking the best-effort callbacks."""
+def _stream_final_message(stream_fn, api_kwargs, log_prefix, on_stream_event, on_response, physical_stream=None):
+    """Aggregate SDK events; optional physical capture owns the native stream."""
+    if physical_stream is not None:
+        final = []
+        def factory(request):
+            with stream_fn(**{k: v for k, v in request.items() if k != "stream"}) as stream:
+                if callable(on_response):
+                    try:
+                        on_response(getattr(stream, "response", None))
+                    except Exception:
+                        logger.debug("%son_response callback failed", log_prefix, exc_info=True)
+                for event in stream:
+                    yield event
+                final.append(stream.get_final_message())
+        captured = physical_stream(api_kwargs, factory, lambda: final[0] if final else None)
+        try:
+            for event in captured:
+                if callable(on_stream_event):
+                    try:
+                        on_stream_event(event)
+                    except TimeoutError:
+                        raise
+                    except Exception:
+                        logger.debug("%son_stream_event callback failed", log_prefix, exc_info=True)
+        finally:
+            close = getattr(captured, "close", None)
+            if callable(close):
+                close()
+        return final[0]
     with stream_fn(**{k: v for k, v in api_kwargs.items() if k != "stream"}) as stream:
         if callable(on_response):
             try:
@@ -648,7 +675,7 @@ def _stream_final_message(stream_fn, api_kwargs, log_prefix, on_stream_event, on
 
 def create_anthropic_message(
     client: Any, api_kwargs: dict, *, log_prefix: str = "", prefer_stream: bool = True,
-    on_stream_event=None, on_response=None,
+    on_stream_event=None, on_response=None, physical_attempt=None, physical_stream=None,
 ) -> Any:
     """Create an Anthropic message, aggregating via stream when available. Some Anthropic-compatible
     gateways are SSE-only and answer ``create()`` with ``text/event-stream``, which the SDK surfaces
@@ -661,9 +688,15 @@ def create_anthropic_message(
     sanitize_anthropic_kwargs(api_kwargs, log_prefix=log_prefix)
     messages_api = getattr(client, "messages", None)
     stream_fn = getattr(messages_api, "stream", None)
+    def invoke(request, callback):
+        return physical_attempt(request, callback) if physical_attempt is not None else callback(request)
     if prefer_stream and callable(stream_fn):
         try:
-            return _stream_final_message(stream_fn, api_kwargs, log_prefix, on_stream_event, on_response)
+            if physical_stream is not None:
+                return _stream_final_message(stream_fn, {**api_kwargs, "stream": True},
+                    log_prefix, on_stream_event, on_response, physical_stream)
+            return invoke({**api_kwargs, "stream": True}, lambda request: _stream_final_message(
+                stream_fn, request, log_prefix, on_stream_event, on_response))
         except TimeoutError:
             raise
         except Exception as exc:
@@ -672,7 +705,8 @@ def create_anthropic_message(
             logger.debug(
                 "%sAnthropic Messages stream unavailable; falling back to messages.create(): %s", log_prefix, exc
             )
-    return messages_api.create(**{k: v for k, v in api_kwargs.items() if k != "stream"})
+    return invoke({k: v for k, v in api_kwargs.items() if k != "stream"},
+                  lambda request: messages_api.create(**request))
 
 
 # ---- BEGIN PLUGIN-COMPAT (revert-scheduled; see COMPAT_MANIFEST.md) ----

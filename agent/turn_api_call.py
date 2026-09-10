@@ -9,6 +9,10 @@ redirect ``_model_request_active`` bracket and the response-vs-redirect crossing
 from __future__ import annotations
 
 from contextlib import nullcontext
+from contextvars import ContextVar
+
+# Copied into request worker contexts; never shared mutable agent retry state.
+PRIMARY_RETRY_COUNT: ContextVar[int] = ContextVar("primary_retry_count", default=0)
 from dataclasses import dataclass
 import logging
 import time
@@ -89,15 +93,19 @@ def perform_api_call(
             return agent._interruptible_streaming_api_call(
                 next_api_kwargs, on_first_delta=_stop_spinner
             )
-        from agent import relay_llm
+        if agent.api_mode == "codex_responses":
+            # The synchronous facade still opens a physical Responses stream.
+            # Its prepared boundary owns capture and policy, not this wrapper.
+            return agent._interruptible_api_call(next_api_kwargs)
+        from agent import relay_invocation
 
-        return relay_llm.execute(
+        return relay_invocation.managed_execute(
             next_api_kwargs,
             agent._interruptible_api_call,
             session_id=str(agent.session_id or ""),
             name=str(agent.provider or "provider"),
             model_name=str(agent.model or ""),
-            metadata={
+            metadata=relay_invocation.attempt_metadata({
                 "api_mode": agent.api_mode,
                 "api_request_id": api_request_id,
                 "call_role": (
@@ -108,7 +116,7 @@ def perform_api_call(
                     else "primary"
                 ),
                 "retry_count": retry_count,
-            },
+            }),
             defer_logical_completion=True,
         )
 
@@ -122,6 +130,7 @@ def perform_api_call(
     with _bracket:
         if _model_request_active is not None:
             _model_request_active.set()
+    retry_token = PRIMARY_RETRY_COUNT.set(retry_count)
     try:
         response = run_llm_execution_middleware(
             api_kwargs, _perform_api_call, original_request=_original_api_kwargs,
@@ -131,6 +140,7 @@ def perform_api_call(
             api_call_count=api_call_count, middleware_trace=list(_llm_middleware_trace),
         )
     finally:
+        PRIMARY_RETRY_COUNT.reset(retry_token)
         with _bracket:
             if _model_request_active is not None:
                 _model_request_active.clear()

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import contextvars
+import uuid
 import json
 import logging
 from collections.abc import Callable
@@ -12,15 +13,61 @@ from agent import relay_llm, relay_runtime
 
 logger = logging.getLogger(__name__)
 
+# Separate policy attempts from dispatches without changing native middleware order.
+_ATTEMPT: contextvars.ContextVar[str | None] = contextvars.ContextVar("hermes_tool_attempt", default=None)
+_INVOCATION: contextvars.ContextVar[str | None] = contextvars.ContextVar("hermes_tool_invocation", default=None)
+
+
+def invoke_authorized(tool_name, args, callback, *, session_id, tool_call_id=None):
+    """Observe only a dispatch whose host policy and final rewrites already ran.
+
+    Manual native calls sanitize payloads but cannot replay policy or dispatch.
+    A fresh identity is allocated per actual callback, never for a denied attempt.
+    """
+    runtime, session, parent = relay_runtime.resolve_capture_context(session_id)
+    if runtime is None or session is None or not runtime.managed_execution_enabled():
+        return callback(args)
+    from agent.relay_passive import capture_tool
+
+    invocation_id = str(uuid.uuid4())
+    metadata = {
+        "hermes.tool.phase": "authorized_invocation",
+        "hermes.tool.attempt_id": _ATTEMPT.get() or "",
+        "hermes.tool.invocation_id": invocation_id,
+        "hermes.tool.parent_invocation_id": _INVOCATION.get() or "",
+    }
+    with capture_tool(runtime, session, parent, tool_name, args, tool_call_id, metadata) as record:
+        token = _INVOCATION.set(invocation_id)
+        try:
+            result = callback(args)
+            record["response"] = _jsonable(result)
+            return result
+        finally:
+            _INVOCATION.reset(token)
+
 
 def execute(
     tool_name: str, args: dict[str, Any], callback: Callable[[dict[str, Any]], Any], *,
     session_id: str, tool_call_id: str | None = None, metadata: dict[str, Any] | None = None,
 ) -> tuple[Any, dict[str, Any]]:
     """Run one tool call through Relay and return its final arguments."""
-    runtime, session, parent = relay_runtime.resolve_execution_context(session_id)
+    runtime, session, parent = relay_runtime.resolve_capture_context(session_id)
     if runtime is None or session is None or not runtime.managed_execution_enabled():
         return callback(args), args
+    attempt_id = str(uuid.uuid4())
+    metadata = {**(metadata or {}), "hermes.tool.phase": "managed_attempt",
+                "hermes.tool.attempt_id": attempt_id,
+                "hermes.tool.parent_invocation_id": _INVOCATION.get() or ""}
+    if relay_runtime._MANAGED_CALLBACK_DEPTH.get() > 0:
+        from agent.relay_passive import capture_tool
+        with capture_tool(runtime, session, parent, tool_name, args, tool_call_id, metadata) as record:
+            token = _ATTEMPT.set(attempt_id)
+            try:
+                result = callback(args)
+                record["response"] = _jsonable(result)
+                return result, args
+            finally:
+                _ATTEMPT.reset(token)
     observed_args = args
     raw_result: dict[str, Any] = {}
     callback_error: BaseException | None = None
@@ -32,7 +79,11 @@ def execute(
         # which is blocked until the tool returns.
         # See #77244.
         with relay_runtime.managed_callback_guard():
-            return callback(final_args)
+            token = _ATTEMPT.set(attempt_id)
+            try:
+                return callback(final_args)
+            finally:
+                _ATTEMPT.reset(token)
 
     def invoke(next_args: Any) -> Any:
         nonlocal callback_error, observed_args

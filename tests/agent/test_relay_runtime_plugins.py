@@ -982,6 +982,21 @@ mode = "strict"
     )
     monkeypatch.setenv(relay_runtime.RELAY_PLUGINS_CONFIG_ENV, str(config))
 
+    if hasattr(relay.plugin, "PluginHostActivation"):
+        monkeypatch.setenv("HOME", str(tmp_path))
+        monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "xdg"))
+        # Core now resolves dynamic declarations itself. This incomplete manifest
+        # must be reported, not silently dropped by Hermes's config adapter.
+        with pytest.raises(ValueError, match="invalid relay-plugin.toml"):
+            relay.plugin.validate({}, additional_plugins_toml=config)
+        host = relay_runtime.RelayRuntime(relay=relay, profile_key="profile")
+        try:
+            assert not host.managed_execution_enabled()
+            assert host._plugin_configuration_state.name == "FAILED"
+        finally:
+            host.shutdown()
+        return
+
     plugin_config, specs = relay_runtime._configured_plugin_inputs(relay)
 
     assert plugin_config == {"version": 1}
@@ -1036,7 +1051,9 @@ mode = "overwrite"
     monkeypatch.chdir(working_directory)
     monkeypatch.setenv("XDG_CONFIG_HOME", str(xdg_config_home))
     monkeypatch.delenv(relay_runtime.RELAY_PLUGINS_CONFIG_ENV, raising=False)
-    relay.plugin.clear()
+    monkeypatch.setenv("HOME", str(tmp_path))
+    if callable(clear := getattr(relay.plugin, "clear", None)):
+        clear()
 
     host = relay_runtime.RelayRuntime(relay=relay, profile_key="profile")
     try:
@@ -1119,7 +1136,9 @@ mode = "overwrite"
         relay_runtime.RELAY_PLUGINS_CONFIG_ENV,
         str(selected_config),
     )
-    relay.plugin.clear()
+    monkeypatch.setenv("HOME", str(tmp_path))
+    if callable(clear := getattr(relay.plugin, "clear", None)):
+        clear()
 
     host = relay_runtime.RelayRuntime(relay=relay, profile_key="profile")
     try:
@@ -1184,7 +1203,9 @@ agent_version = "test"
     monkeypatch.setenv("XDG_CONFIG_HOME", str(xdg_config_home))
     monkeypatch.setenv(relay_runtime.RELAY_PLUGINS_CONFIG_ENV, str(config_path))
     monkeypatch.setattr(relay_runtime, "_load_nemo_relay", lambda: relay)
-    relay.plugin.clear()
+    monkeypatch.setenv("HOME", str(tmp_path))
+    if callable(clear := getattr(relay.plugin, "clear", None)):
+        clear()
 
     runtime_ids: dict[str, str] = {}
     try:

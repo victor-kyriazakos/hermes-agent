@@ -2228,11 +2228,13 @@ def _relay_stream_identity(agent, name_default: str) -> dict:
         "model_name": str(getattr(agent, "model", "") or "")}
 
 
-def _relay_stream_metadata(agent, api_mode: str) -> dict:
+def _relay_stream_metadata(agent, api_mode: str, reconnect_ordinal: int = 0) -> dict:
+    from agent.turn_api_call import PRIMARY_RETRY_COUNT
     call_role = ("delegated" if getattr(agent, "is_subagent", False)
                  else "fallback" if int(getattr(agent, "_fallback_index", 0) or 0) > 0 else "primary")
     return {"api_mode": api_mode, "api_request_id": getattr(agent, "_current_api_request_id", None),
-        "call_role": call_role}
+        "call_role": call_role, "retry_count": PRIMARY_RETRY_COUNT.get(),
+        "reconnect_ordinal": reconnect_ordinal}
 
 
 def _stream_final_text(response) -> str:
@@ -2691,9 +2693,6 @@ class _StreamingCall(StreamingWaitMonitor):
         return usage, finish_reason
 
     def _open_chat_stream(self, stream_kwargs: dict[str, Any]):
-        # Native Gemini rejects OpenAI's usage-streaming extension.
-        if not is_native_gemini_base_url(self.agent.base_url):
-            stream_kwargs["stream_options"] = {"include_usage": True}
         request_client = self._attempt_request_client = self.clients.set_client(
             self.agent._create_request_openai_client(reason="chat_completion_stream_request", api_kwargs=stream_kwargs))
         self.last_chunk_time["t"] = time.time()
@@ -2758,9 +2757,14 @@ class _StreamingCall(StreamingWaitMonitor):
         from agent.chat_completion_helpers_relay import RelayChatAccumulator
         relay_response = RelayChatAccumulator()
 
+        stream_kwargs = {**self.api_kwargs, "stream": True}
+        # Prepare before Relay START; never mutate the cached caller request.
+        if not is_native_gemini_base_url(self.agent.base_url):
+            stream_kwargs["stream_options"] = {"include_usage": True}
+        stream_kwargs["timeout"] = _httpx.Timeout(connect=conn_cap, read=read_timeout, write=base_timeout, pool=conn_cap)
+
         def _open_stream(next_api_kwargs: dict[str, Any]):
-            timeout = _httpx.Timeout(connect=conn_cap, read=read_timeout, write=base_timeout, pool=conn_cap)
-            return self._open_chat_stream({**next_api_kwargs, "stream": True, "timeout": timeout})
+            return self._open_chat_stream(next_api_kwargs)
 
         def _flush_pending_stream_text():
             pending_parts = list(pending_text_parts)
@@ -2769,12 +2773,12 @@ class _StreamingCall(StreamingWaitMonitor):
                 (self._route_suppressed_text if tool_calls_acc else self._emit_text)(text)
 
         from agent import relay_llm
-        stream = self._set_managed_stream(relay_llm.stream(self.api_kwargs, _open_stream,
+        stream = self._set_managed_stream(relay_llm.stream(stream_kwargs, _open_stream,
             **_relay_stream_identity(self.agent, "provider"), finalizer=relay_response.finalize,
             on_stream_created=self._chat_stream_created, on_chunk=relay_response.observe,
             accept_chunk=lambda chunk: self._accept_chat_chunk(stream_attempt_id, chunk),
             completed_response_predicate=lambda value: hasattr(value, "choices"),
-            metadata=_relay_stream_metadata(self.agent, "chat_completions"), defer_logical_completion=True))
+            metadata=_relay_stream_metadata(self.agent, "chat_completions", getattr(self, "reconnect_ordinal", 0)), defer_logical_completion=True))
         if self.agent.provider == "moa":
             # Hermes interrupts the managed stream; Relay alone closes the provider stream.
             self.clients.set_stream_handle(stream)
@@ -2984,13 +2988,19 @@ class _StreamingCall(StreamingWaitMonitor):
         from agent import relay_llm
         from agent.anthropic_adapter import sanitize_anthropic_kwargs
         accumulator = relay_llm.AnthropicStreamAccumulator()
+        from agent import relay_invocation
+        invocation_metadata = relay_invocation.attempt_metadata(
+            _relay_stream_metadata(self.agent, "anthropic_messages", getattr(self, "reconnect_ordinal", 0)))
 
         def _open_anthropic_stream(next_api_kwargs: dict[str, Any]):
             final_kwargs = dict(next_api_kwargs)
             sanitize_anthropic_kwargs(final_kwargs, log_prefix=getattr(self.agent, "log_prefix", ""))
-            manager = request_client.messages.stream(**final_kwargs)
-            _stream_context["manager"] = manager
-            return manager.__enter__()
+            def factory(request):
+                manager = request_client.messages.stream(**{k: v for k, v in request.items() if k != "stream"})
+                _stream_context["manager"] = manager
+                return manager.__enter__()
+            return relay_invocation.stream({**final_kwargs, "stream": True}, factory,
+                **_relay_stream_identity(self.agent, "anthropic"), metadata=invocation_metadata)
 
         def _anthropic_stream_created(raw_stream: Any) -> None:
             _stream_context["stream"] = raw_stream
@@ -2999,11 +3009,11 @@ class _StreamingCall(StreamingWaitMonitor):
                 lambda: self.agent._stream_diag_capture_response(_diag, getattr(raw_stream, "response", None)))
             self._writer_token = claim_stream_writer(self.agent)
 
-        stream = self._set_managed_stream(relay_llm.stream(self.api_kwargs, _open_anthropic_stream,
+        stream = self._set_managed_stream(relay_invocation.ManagedStream(self.api_kwargs, _open_anthropic_stream,
             **_relay_stream_identity(self.agent, "anthropic"), finalizer=accumulator.finalize,
             on_stream_created=_anthropic_stream_created, on_chunk=accumulator.observe,
             accept_chunk=lambda _event: self._writer_still_current("Anthropic streaming"),
-            metadata=_relay_stream_metadata(self.agent, "anthropic_messages"), defer_logical_completion=True))
+            metadata=invocation_metadata, defer_logical_completion=True))
         try:
             for event in stream:
                 saw_stream_event = True
@@ -3152,6 +3162,7 @@ class _StreamingCall(StreamingWaitMonitor):
         _max_stream_retries = env_int("HERMES_STREAM_RETRIES", 2)
         try:
             for _stream_attempt in range(_max_stream_retries + 1):
+                self.reconnect_ordinal = _stream_attempt
                 stream_attempt_id = self._start_stream_attempt()
                 # Otherwise /stop closes the connection and the retry opens a
                 # FRESH one, blocking up to a full read timeout per attempt.

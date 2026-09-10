@@ -229,6 +229,15 @@ class _ProcessRelayPluginConfiguration:
                 return _RelayPluginConfigurationState.DISABLED
         except Exception as exc:
             self._activation = None
+            # The owned-host API replaces report() with an atomic native lease.
+            # PyO3 currently exposes its ownership conflict as RuntimeError.
+            if (
+                isinstance(getattr(relay.plugin, "PluginHostActivation", None), type)
+                and isinstance(exc, RuntimeError)
+                and str(exc) == "conflict: plugin configuration is owned by an active dynamic plugin host"
+            ):
+                logger.warning("Relay plugin configuration is owned outside Hermes; leaving it unchanged")
+                return _RelayPluginConfigurationState.FOREIGN
             logger.warning("Hermes Relay plugin initialization failed: %s", exc, exc_info=True)
             return _RelayPluginConfigurationState.FAILED
         self._relay = relay
@@ -241,6 +250,10 @@ class _ProcessRelayPluginConfiguration:
                 "Hermes Relay plugin cleanup is still pending; refusing to replace the process-global configuration"
             )
             return _RelayPluginConfigurationState.FAILED
+        if isinstance(getattr(relay.plugin, "PluginHostActivation", None), type):
+            # No global report exists on this API. initialize() acquires the
+            # native ownership lease atomically before installing any callbacks.
+            return None
         try:
             existing_report = relay.plugin.report()
         except Exception:
@@ -259,6 +272,21 @@ class _ProcessRelayPluginConfiguration:
 
     def _initialize(self, relay: Any) -> bool:
         """Initialize Relay from the selected plugins.toml; False when none is selected."""
+        if isinstance(getattr(relay.plugin, "PluginHostActivation", None), type):
+            configured = os.getenv(RELAY_PLUGINS_CONFIG_ENV, "").strip()
+            if not configured:
+                # Preserve legacy-config diagnostics without invoking native discovery.
+                _configured_plugin_inputs(relay)
+                return False
+            # Core now owns static + dynamic resolution. Passing the selected file
+            # explicitly prevents unrelated user-file discovery from overlaying it.
+            activation = _resolve_plugin_awaitable(
+                relay.plugin.initialize({}, additional_plugins_toml=Path(configured).expanduser())
+            )
+            if not isinstance(activation, relay.plugin.PluginHostActivation):
+                raise RuntimeError("NeMo Relay plugin initialization returned no owned activation handle")
+            self._activation = activation
+            return True
         configured_inputs = _configured_plugin_inputs(relay)
         if configured_inputs is None:
             return False
@@ -385,6 +413,7 @@ class RelayRuntime:
                 if parent is not None:
                     parent_handle = parent.handle
             scope_metadata["nemo_relay_scope_role"] = "subagent"
+        scope_metadata.update(host_id_metadata(session_id=session.session_id))
         context = contextvars.Context()
         args = (self.relay.scope.push, SESSION_SCOPE, self.relay.ScopeType.Agent)
         push_kwargs.update(handle=parent_handle, metadata=scope_metadata, input={})
@@ -945,7 +974,10 @@ class RelaySessionCoordinator:
             turn.handle = _warn_on_error(
                 "turn initialization", host.run_in_session, lease.session, host.relay.scope.push,
                 TURN_SCOPE, host.relay.ScopeType.Function, handle=lease.session.handle, input={},
-                metadata=runtime_metadata(host.runtime_id, **{"hermes.execution_surface": lease.platform or "unknown"}),
+                metadata=runtime_metadata(host.runtime_id, **{
+                    "hermes.execution_surface": lease.platform or "unknown",
+                    **host_id_metadata(session_id=lease.session_id, turn_id=turn_id),
+                }),
                 timeout=_SCOPE_OP_TIMEOUT,
             )
         turn._previous_turn = _CURRENT_TURN.get()
@@ -1134,6 +1166,11 @@ def active_turn(session_id: str | None = None) -> RelayTurnContext | None:
     return turn
 
 
+def host_id_metadata(**identifiers: Any) -> dict[str, str]:
+    """Host identifiers are opaque strings, not values to normalize or coerce."""
+    return {f"hermes.{key}": value for key, value in identifiers.items() if isinstance(value, str) and value}
+
+
 def resolve_execution_context(session_id: str) -> tuple[RelayRuntime | None, RelaySession | None, Any]:
     """Resolve one active turn/session parent for managed Relay execution."""
     # Nested managed execution is impossible (see _MANAGED_CALLBACK_DEPTH); the outer scope
@@ -1146,6 +1183,13 @@ def resolve_execution_context(session_id: str) -> tuple[RelayRuntime | None, Rel
         # call (the vision_analyze auxiliary path) therefore awaits a foreign-loop Future that can never
         # complete — "attached to a different loop" at best, deadlock at worst, and "Event loop is closed"
         # during shutdown when the orphaned Future is completed late (#77244).
+        return None, None, None
+    return resolve_capture_context(session_id)
+
+
+def resolve_capture_context(session_id: str) -> tuple[RelayRuntime | None, RelaySession | None, Any]:
+    """Resolve observation without admitting nested managed execution."""
+    if not relay_instrumentation_enabled():
         return None, None, None
     turn = active_turn(session_id)
     host = turn.lease.live_runtime() if turn is not None else None

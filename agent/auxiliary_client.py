@@ -1456,8 +1456,11 @@ class _CodexCompletionsAdapter:
             guard.start()
             from agent.codex_runtime import _bypass_sdk_request_transform, _consume_codex_event_stream
             # Keep bulk wire payload out of the SDK's GIL-holding request transform.
-            stream_kwargs = _bypass_sdk_request_transform({**resp_kwargs, "stream": True})
-            event_stream = self._client.responses.create(**stream_kwargs)
+            stream_kwargs = {**resp_kwargs, "stream": True}
+            event_stream = _relay_auxiliary_native_stream(
+                stream_kwargs,
+                lambda request: self._client.responses.create(**_bypass_sdk_request_transform(request)),
+                api_mode="codex_responses", completed_response_predicate=lambda value: hasattr(value, "output"))
             guard.adopt_stream(event_stream)
             # The timer may fire while responses.create() is blocked; if the cancelled attempt
             # had no stream to close then, close it now that it is attempt-owned — never the shared client.
@@ -1667,6 +1670,10 @@ class _AnthropicCompletionsAdapter:
         response = create_anthropic_message(
             self._client,
             anthropic_kwargs,
+            physical_attempt=_relay_native_anthropic_attempt,
+            physical_stream=(lambda request, factory, final: _relay_auxiliary_native_stream(
+                request, factory, api_mode="anthropic_messages", finalizer=final))
+                if _RELAY_AUX_CALL_CONTEXT.get() is not None else None,
             # Record provider-response timing every event, but tick forward progress only for
             # substantive payloads so keepalives can't hold a stalled summary open. None keeps
             # the fast get_final_message path.
@@ -2379,11 +2386,14 @@ def _relay_aux_call_scope(args: tuple, kwargs: dict):
         "response_model": None,
         "api_mode": "chat_completions",
     })
+    from agent.relay_auxiliary import standalone_context
     try:
-        yield
-    except BaseException:
-        _fail_relay_auxiliary_call()
-        raise
+        with standalone_context(_RELAY_AUX_CALL_CONTEXT.get()["request_id"]):
+            try:
+                yield
+            except BaseException as exc:
+                _fail_relay_auxiliary_call(exc)
+                raise
     finally:
         _RELAY_AUX_CALL_CONTEXT.reset(token)
 
@@ -2392,6 +2402,10 @@ def _relay_auxiliary_call(callback):
     """Give every physical retry in one auxiliary call a shared Relay identity."""
     @functools.wraps(callback)
     def wrapped(*args, **kwargs):
+        if kwargs.get("stream"):
+            from agent.relay_auxiliary import call_with_stream_lifetime
+            return call_with_stream_lifetime(
+                _relay_aux_call_scope(args, kwargs), lambda: callback(*args, **kwargs))
         with _relay_aux_call_scope(args, kwargs):
             return callback(*args, **kwargs)
     return wrapped
@@ -2439,9 +2453,54 @@ def _relay_auxiliary_metadata(
         "api_mode": str(api_mode or context.get("api_mode") or "chat_completions"),
         "api_request_id": str(context["request_id"]),
         "call_role": f"auxiliary:{context['task']}",
-        "retry_count": attempt_count,
+        "retry_count": max(0, int(context.get("retry_count", -1))),
+        "attempt_ordinal": attempt_count,
         "auxiliary_task": str(context["task"]),
     }
+
+
+def _native_auxiliary_adapter(client):
+    adapter = getattr(getattr(client, "chat", None), "completions", None)
+    if isinstance(adapter, _AsyncCompletionsAdapter):
+        adapter = adapter._sync
+    return isinstance(adapter, (_AnthropicCompletionsAdapter, _CodexCompletionsAdapter))
+
+
+def _relay_auxiliary_native_stream(request, factory, *, api_mode, finalizer=None,
+                                   completed_response_predicate=None, provider=None,
+                                   defer_logical_completion=True):
+    route = _relay_auxiliary_metadata(provider=provider, api_mode=api_mode)
+    if route is None:
+        return factory(request)
+    from agent import relay_llm
+    from agent.relay_llm import _jsonable
+    try:
+        from nemo_relay.streaming import AnthropicAccumulator, ChatAccumulator, ResponsesAccumulator
+    except ImportError:
+        # Stock Relay <0.9 has no structured collectors; preserve provider availability.
+        return factory(request)
+    collector = {"anthropic_messages": AnthropicAccumulator,
+                 "codex_responses": ResponsesAccumulator}.get(api_mode, ChatAccumulator)()
+    provider_name, model, metadata = route
+    def snapshot():
+        result = finalizer() if finalizer is not None else None
+        return _jsonable(result) if result is not None else collector.finalize()
+    return relay_llm.stream_current(request, factory, name=provider_name,
+        model_name=str(request.get("model") or model), metadata=metadata,
+        on_chunk=lambda chunk: collector.collect(_jsonable(chunk)), finalizer=snapshot,
+        defer_logical_completion=defer_logical_completion,
+        completed_response_predicate=completed_response_predicate)
+
+
+def _relay_native_anthropic_attempt(request, callback):
+    route = _relay_auxiliary_metadata(api_mode="anthropic_messages")
+    if route is None:
+        return callback(request)
+    from agent import relay_llm
+    provider, model, metadata = route
+    return relay_llm.execute_current(request, callback, name=provider,
+        model_name=str(request.get("model") or model), metadata=metadata,
+        defer_logical_completion=True)
 
 
 def _relay_sync_completion(
@@ -2454,7 +2513,23 @@ def _relay_sync_completion(
     # The progress hook is installed per TASK, so every attempt (retries, recovery rungs, fallbacks)
     # must stream through _create_with_progress or the compression watchdog sees silence (#98466).
     callback = create or (lambda request: _create_with_progress(client, request))
-    route = _relay_auxiliary_metadata(provider=provider, api_mode=api_mode)
+    # Retries and stream negotiation capture each physical invocation below.
+    context = _RELAY_AUX_CALL_CONTEXT.get()
+    if context is not None:
+        # One outer completion may negotiate/reconnect through multiple physical calls.
+        context["retry_count"] = int(context.get("retry_count", -1)) + 1
+        if provider is not None:
+            context["provider"] = provider
+        if api_mode is not None:
+            context["api_mode"] = api_mode
+    return _run_protected_sync_provider_call(callback, kwargs)
+
+
+def _relay_sync_physical_create(client, kwargs):
+    callback = lambda request: client.chat.completions.create(**request)
+    if _native_auxiliary_adapter(client):
+        return callback(kwargs)
+    route = _relay_auxiliary_metadata()
     # Isolate only the provider callback so the owning thread can unwind its lease/DB
     # transaction on hard cancel without touching the shared client.
     if route is None:
@@ -2477,7 +2552,23 @@ async def _relay_async_completion(
     kwargs = prepare_chat_messages(client, kwargs)
     # Async twin of the seam default above (#98466).
     callback = create or (lambda request: _acreate_with_progress(client, request))
-    route = _relay_auxiliary_metadata(provider=provider, api_mode=api_mode)
+    context = _RELAY_AUX_CALL_CONTEXT.get()
+    if context is not None:
+        # One outer completion may negotiate/reconnect through multiple physical calls.
+        context["retry_count"] = int(context.get("retry_count", -1)) + 1
+        if provider is not None:
+            context["provider"] = provider
+        if api_mode is not None:
+            context["api_mode"] = api_mode
+    return await callback(kwargs)
+
+
+async def _relay_async_physical_create(client, kwargs):
+    async def callback(request):
+        return await client.chat.completions.create(**request)
+    if _native_auxiliary_adapter(client):
+        return await callback(kwargs)
+    route = _relay_auxiliary_metadata()
     if route is None:
         return await callback(kwargs)
     provider_name, fallback_model, metadata = route
@@ -2488,22 +2579,43 @@ async def _relay_async_completion(
     )
 
 
+async def _relay_async_stream(client, kwargs):
+    async def factory(request):
+        return await client.chat.completions.create(**request)
+    if _native_auxiliary_adapter(client):
+        return await factory(kwargs)
+    route = _relay_auxiliary_metadata(api_mode="chat_completions")
+    if route is None:
+        return await factory(kwargs)
+    try:
+        from nemo_relay.streaming import ChatAccumulator
+    except ImportError:
+        return await factory(kwargs)
+    from agent import relay_llm
+    collector = ChatAccumulator()
+    provider, model, metadata = route
+    return await relay_llm.stream_current_async(
+        kwargs, factory, name=provider, model_name=str(kwargs.get("model") or model),
+        metadata=metadata, on_chunk=lambda chunk: collector.collect(relay_llm._jsonable(chunk)),
+        finalizer=collector.finalize, defer_logical_completion=True,
+        completed_response_predicate=lambda value: hasattr(value, "choices"),
+    )
+
+
 def _relay_sync_stream(
-    client: Any, kwargs: dict[str, Any], *, provider: str | None = None, api_mode: str | None = None
+    client: Any, kwargs: dict[str, Any], *, provider: str | None = None, api_mode: str | None = None,
+    defer_logical_completion: bool = False,
 ) -> Any:
     from agent.auxiliary_wire import prepare_chat_messages
 
     kwargs = prepare_chat_messages(client, kwargs)
-    route = _relay_auxiliary_metadata(provider=provider, api_mode=api_mode)
-    if route is None:
+    if _native_auxiliary_adapter(client):
         return client.chat.completions.create(**kwargs)
-    provider_name, fallback_model, metadata = route
-    from agent import relay_llm
-    return relay_llm.stream_current(
-        kwargs, lambda request: client.chat.completions.create(**request), name=provider_name,
-        model_name=str(kwargs.get("model") or fallback_model), finalizer=dict, metadata=metadata,
-        completed_response_predicate=lambda value: hasattr(value, "choices"),
-    )
+    return _relay_auxiliary_native_stream(kwargs,
+        lambda request: client.chat.completions.create(**request),
+        api_mode=api_mode or "chat_completions", provider=provider,
+        defer_logical_completion=defer_logical_completion,
+        completed_response_predicate=lambda value: hasattr(value, "choices"))
 
 
 _RUNTIME_MAIN_COMPAT_SNAPSHOT: Tuple[Any, ...] = ("", "", "", "", "", "")
@@ -6118,10 +6230,11 @@ def _complete_relay_auxiliary_call(*, outcome: str = "success") -> None:
     )
 
 
-def _fail_relay_auxiliary_call() -> None:
+def _fail_relay_auxiliary_call(error: BaseException | None = None) -> None:
     """Close a terminally failed call without replacing its original error."""
     try:
-        _complete_relay_auxiliary_call(outcome="failed")
+        from agent.relay_llm import _is_cancellation
+        _complete_relay_auxiliary_call(outcome="cancelled" if error is not None and _is_cancellation(error) else "failed")
     except Exception:
         logger.warning("Relay auxiliary failure finalization failed", exc_info=True)
 
@@ -6325,13 +6438,13 @@ def _create_with_progress_once(
     _notify_aux_dispatch()
     _notify_aux_progress()  # Preserve the watchdog's historical dispatch tick.
     if (not _aux_progress_active() and not force_stream) or _client_streams_internally(client):
-        response = client.chat.completions.create(**kwargs)
+        response = _relay_sync_physical_create(client, kwargs)
         if not _client_streams_internally(client):
             _notify_aux_provider_response()
         return response
     stream_kwargs, model, total_ceiling = _stream_request_plan(kwargs)
     try:
-        chunks = client.chat.completions.create(**stream_kwargs)
+        chunks = _relay_sync_stream(client, stream_kwargs, defer_logical_completion=True)
     except Exception as exc:
         # Genuine provider failures aren't streaming's fault — surface unchanged so the
         # recovery chains see the same error as a plain call.
@@ -6343,7 +6456,7 @@ def _create_with_progress_once(
         logger.debug("Auxiliary %s: streamed request failed (%s); retrying non-streaming",
                      task or "call", exc)
         _notify_aux_dispatch()
-        response = client.chat.completions.create(**kwargs)
+        response = _relay_sync_physical_create(client, kwargs)
         _notify_aux_provider_response()
         return response
     # Some shims (MoA quiet mode, defensive adapters) return a complete response despite
@@ -6529,7 +6642,7 @@ async def _aggregate_chat_stream_async(
 async def _acreate_with_stream(client: Any, kwargs: Dict[str, Any], task: Optional[str] = None) -> Any:
     """Async create() for stream-only providers: ``stream=True`` + aggregate the async chunks."""
     stream_kwargs, model, total_ceiling = _stream_request_plan(kwargs)
-    chunks = await client.chat.completions.create(**stream_kwargs)
+    chunks = await _relay_async_stream(client, stream_kwargs)
     if hasattr(chunks, "choices"):  # shims may hand back a complete response despite stream=True
         return chunks
     return await _aggregate_chat_stream_async(chunks, model=model, total_ceiling=total_ceiling)
@@ -6548,13 +6661,13 @@ async def _acreate_with_progress(
     _notify_aux_dispatch()
     _notify_aux_progress()
     if (not _aux_progress_active() and not force_stream) or _async_client_streams_internally(client):
-        response = await client.chat.completions.create(**kwargs)
+        response = await _relay_async_physical_create(client, kwargs)
         if not _async_client_streams_internally(client):
             _notify_aux_provider_response()
         return response
     stream_kwargs, model, total_ceiling = _stream_request_plan(kwargs)
     try:
-        chunks = await client.chat.completions.create(**stream_kwargs)
+        chunks = await _relay_async_stream(client, stream_kwargs)
     except Exception as exc:
         # Only a rejected stream NEGOTIATION falls back to a plain call (mirrors the sync wrapper); a
         # failure mid-consumption below reaches the classified recovery ladder instead of silently
@@ -6565,7 +6678,7 @@ async def _acreate_with_progress(
         logger.debug("Auxiliary %s: streamed async request failed (%s); retrying non-streaming",
                      task or "call", exc)
         _notify_aux_dispatch()
-        response = await client.chat.completions.create(**kwargs)
+        response = await _relay_async_physical_create(client, kwargs)
         _notify_aux_provider_response()
         return response
     if hasattr(chunks, "choices"):  # shims may hand back a complete response despite stream=True
@@ -7238,11 +7351,11 @@ def _call_llm_impl(
         kwargs["stream"] = True
         if stream_options:
             kwargs["stream_options"] = stream_options
-        if task == "moa_aggregator" and isinstance(client, CodexAuxiliaryClient):
-            # Responses-shim clients consume the stream internally and return a completed
-            # object Relay's managed stream would iterate; the MoA facade wraps it as one chunk.
-            return client.chat.completions.create(**kwargs)
-        return _relay_sync_stream(client, kwargs, provider=request_provider, api_mode=req.resolved_api_mode)
+        # Native adapters aggregate before returning, unlike caller-owned Chat streams.
+        result = _relay_sync_stream(client, kwargs, provider=request_provider, api_mode=req.resolved_api_mode)
+        if _native_auxiliary_adapter(client):
+            _complete_relay_auxiliary_call()
+        return result
 
     def _primary(**validate_kw: Any) -> Any:
         # Retry on the same provider for a transient transport blip (connection reset / streaming-close /

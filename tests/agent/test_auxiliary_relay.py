@@ -423,6 +423,7 @@ def test_partial_auxiliary_stream_failure_closes_before_recovery(
                 "model": "test-model",
                 "outcome": "failed",
                 "provider": "openrouter",
+                "response_model": "test-model",  # retained partial provider response
             }
         ]
         assert turn.logical_llm_calls == {}
@@ -435,6 +436,7 @@ def test_partial_auxiliary_stream_failure_closes_before_recovery(
                 "model": "test-model",
                 "outcome": "failed",
                 "provider": "openrouter",
+                "response_model": "test-model",  # retained partial provider response
             },
             {
                 "model": "test-model",

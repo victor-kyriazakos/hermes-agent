@@ -869,6 +869,7 @@ def run_codex_stream(agent, api_kwargs: dict, client: Any = None, on_first_delta
     import httpx as _httpx
     from openai import APIConnectionError as _APIConnectionError
     from agent import relay_llm
+    from agent.turn_api_call import PRIMARY_RETRY_COUNT
     transport_errors = (_httpx.RemoteProtocolError, _httpx.ReadTimeout, _httpx.ConnectError, ConnectionError)
     active_client = client or agent._ensure_primary_openai_client(reason="codex_stream_direct")
     max_stream_retries, model = 1, api_kwargs.get("model")
@@ -917,10 +918,19 @@ def run_codex_stream(agent, api_kwargs: dict, client: Any = None, on_first_delta
             raise TimeoutError("Codex Responses stream request retired before terminal response")
         return bool(agent._interrupt_requested)
 
+    stream_kwargs = _sanitize_consumer_codex_request(agent, api_kwargs)
+    stream_kwargs["stream"] = True
+    # Keep the semantic body visible to the native Responses codec. The SDK
+    # transport-only relocation happens after interception, without changing JSON.
+
     def _open_codex_stream(next_api_kwargs: dict[str, Any]):
-        stream_kwargs = _sanitize_consumer_codex_request(agent, next_api_kwargs)
-        stream_kwargs["stream"] = True
-        return active_client.responses.create(**_bypass_sdk_request_transform(stream_kwargs))
+        # Retain the final safety gate for fields newly introduced by intercepts.
+        prepared = _sanitize_consumer_codex_request(agent, next_api_kwargs)
+        return relay_invocation.stream(prepared,
+            lambda request: active_client.responses.create(**_bypass_sdk_request_transform(request)),
+            session_id=str(getattr(agent, "session_id", "") or ""),
+            name=str(getattr(agent, "provider", "") or "codex"), model_name=str(model or ""),
+            metadata=invocation_metadata)
 
     def _log_failure(exc: BaseException) -> None:
         request_body_bytes, exception_chain = _codex_request_failure_details(exc)
@@ -980,19 +990,30 @@ def run_codex_stream(agent, api_kwargs: dict, client: Any = None, on_first_delta
             with watchdog_state.lock:
                 watchdog_state.retry_started_ts = time.time()
         intercepted_events: list = []
+        try:
+            from nemo_relay.streaming import ResponsesAccumulator
+            capture = ResponsesAccumulator()
+            collect_response, finalize_response = capture.collect, capture.finalize
+        except ImportError:
+            collect_response = intercepted_events.append
+            finalize_response = lambda: _consume_codex_event_stream(list(intercepted_events), model=model)
         writer_token["value"] = event_stream = None
+        from agent import relay_invocation
+        invocation_metadata = relay_invocation.attempt_metadata({
+            "api_mode": "codex_responses", "call_role": call_role,
+            "retry_count": PRIMARY_RETRY_COUNT.get(), "reconnect_ordinal": attempt,
+            "api_request_id": getattr(agent, "_current_api_request_id", None)})
         try:
             try:
-                event_stream = relay_llm.stream(
-                    dict(api_kwargs), _open_codex_stream,
+                event_stream = relay_invocation.ManagedStream(
+                    dict(stream_kwargs), _open_codex_stream,
                     session_id=str(getattr(agent, "session_id", "") or ""),
                     name=str(getattr(agent, "provider", "") or "codex"), model_name=str(model or ""),
-                    finalizer=lambda: _consume_codex_event_stream(list(intercepted_events), model=model),
-                    on_stream_created=_codex_stream_created, on_chunk=intercepted_events.append,
+                    finalizer=finalize_response,
+                    on_stream_created=_codex_stream_created, on_chunk=collect_response,
                     chunk_adapter=lambda chunk: chunk, accept_chunk=_accept_codex_chunk,
                     completed_response_predicate=lambda r: bool(hasattr(r, "output") and not hasattr(r, "__iter__")),
-                    metadata={"api_mode": "codex_responses", "call_role": call_role, "retry_count": attempt,
-                              "api_request_id": getattr(agent, "_current_api_request_id", None)},
+                    metadata=invocation_metadata,
                     defer_logical_completion=True,
                 )
                 final = _consume_codex_event_stream(
