@@ -307,7 +307,8 @@ def model_call_dimensions(event: Any) -> dict[str, str] | None:
 def _auxiliary_model_call_dimensions(event: Any) -> dict[str, str] | None:
     """Project a terminal auxiliary route from its Hermes logical scope."""
     metadata = _relay_metadata(
-        event, RUNTIME_SCHEMA_KEY, RUNTIME_SCHEMA_VERSION, "hermes.call_role"
+        event, RUNTIME_SCHEMA_KEY, RUNTIME_SCHEMA_VERSION,
+        "hermes.call_role", "hermes.api_request_id"
     )
     call_role = (metadata or {}).get("hermes.call_role")
     data = getattr(event, "data", None)

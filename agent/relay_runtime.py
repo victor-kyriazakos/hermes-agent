@@ -232,7 +232,7 @@ class _ProcessRelayPluginConfiguration:
             # The owned-host API replaces report() with an atomic native lease.
             # PyO3 currently exposes its ownership conflict as RuntimeError.
             if (
-                isinstance(getattr(relay.plugin, "PluginHostActivation", None), type)
+                isinstance(getattr(getattr(relay, "plugin", None), "PluginHostActivation", None), type)
                 and isinstance(exc, RuntimeError)
                 and str(exc) == "conflict: plugin configuration is owned by an active dynamic plugin host"
             ):
@@ -250,7 +250,7 @@ class _ProcessRelayPluginConfiguration:
                 "Hermes Relay plugin cleanup is still pending; refusing to replace the process-global configuration"
             )
             return _RelayPluginConfigurationState.FAILED
-        if isinstance(getattr(relay.plugin, "PluginHostActivation", None), type):
+        if isinstance(getattr(getattr(relay, "plugin", None), "PluginHostActivation", None), type):
             # No global report exists on this API. initialize() acquires the
             # native ownership lease atomically before installing any callbacks.
             return None
@@ -272,7 +272,7 @@ class _ProcessRelayPluginConfiguration:
 
     def _initialize(self, relay: Any) -> bool:
         """Initialize Relay from the selected plugins.toml; False when none is selected."""
-        if isinstance(getattr(relay.plugin, "PluginHostActivation", None), type):
+        if isinstance(getattr(getattr(relay, "plugin", None), "PluginHostActivation", None), type):
             configured = os.getenv(RELAY_PLUGINS_CONFIG_ENV, "").strip()
             if not configured:
                 # Preserve legacy-config diagnostics without invoking native discovery.

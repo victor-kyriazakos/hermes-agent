@@ -195,7 +195,13 @@ def test_auxiliary_provider_fallback_records_one_terminal_model_route(
         runtime_id=turn.lease.host.runtime_id,
     )
     subscriber_name = "test.auxiliary-model-route"
-    relay.subscribers.register(subscriber_name, subscriber)
+    observed = []
+
+    def observe(event):
+        observed.append(event)
+        subscriber(event)
+
+    relay.subscribers.register(subscriber_name, observe)
     turn.lease.host.retain_managed_execution(subscriber_name)
     responses = iter([
         SimpleNamespace(model="failed/model", choices=[]),
@@ -250,6 +256,31 @@ def test_auxiliary_provider_fallback_records_one_terminal_model_route(
     assert result.choices[0].message.content == "recovered"
     snapshot = store.counter_snapshot()
     assert len(snapshot) == 1
+    logical_ends = [event for event in observed
+                    if str(event.name) == relay_runtime.LOGICAL_LLM_SCOPE
+                    and str(event.scope_category) == "end"]
+    assert len(logical_ends) == 1
+    terminal = logical_ends[0]
+    assert terminal.data == {
+        "model": "fallback/configured-model", "outcome": "success",
+        "provider": "OpenRouter", "response_model": "Accepted/Model",
+    }
+    assert terminal.metadata["hermes.api_request_id"].startswith("aux-")
+    assert turn.logical_llm_calls == {}
+    # Correlation metadata is accepted but never projected; arbitrary content
+    # on either metadata or the logical payload must still fail closed.
+    from hermes_cli.observability.shared_metrics_contract import model_call_dimensions
+    for field in ("metadata", "data"):
+        candidate = SimpleNamespace(
+            kind=str(terminal.kind), category=str(terminal.category),
+            name=str(terminal.name), scope_category=str(terminal.scope_category),
+            category_profile=terminal.category_profile,
+            data=dict(terminal.data), metadata=dict(terminal.metadata),
+        )
+        getattr(candidate, field)["content"] = "private prompt"
+        assert model_call_dimensions(candidate) is None
+    assert "recovered" not in str(snapshot)
+    assert "aux-" not in str(snapshot)
     assert snapshot[0]["metric_name"] == MODEL_ROUTE_METRIC
     assert snapshot[0]["resource"]["hermes_version"] == "test-version"
     assert snapshot[0]["dimensions"] == {

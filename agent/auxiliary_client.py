@@ -7351,11 +7351,14 @@ def _call_llm_impl(
         kwargs["stream"] = True
         if stream_options:
             kwargs["stream_options"] = stream_options
-        # Native adapters aggregate before returning, unlike caller-owned Chat streams.
-        result = _relay_sync_stream(client, kwargs, provider=request_provider, api_mode=req.resolved_api_mode)
+        # Native adapters own aggregation and capture at their wire boundary. Do not
+        # route their completed response through the caller-owned Chat stream seam.
         if _native_auxiliary_adapter(client):
+            from agent.auxiliary_wire import prepare_chat_messages
+            result = client.chat.completions.create(**prepare_chat_messages(client, kwargs))
             _complete_relay_auxiliary_call()
-        return result
+            return result
+        return _relay_sync_stream(client, kwargs, provider=request_provider, api_mode=req.resolved_api_mode)
 
     def _primary(**validate_kw: Any) -> Any:
         # Retry on the same provider for a transient transport blip (connection reset / streaming-close /

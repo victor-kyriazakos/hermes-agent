@@ -188,3 +188,46 @@ def test_public_native_error_payload_sanitizer(capture, monkeypatch, outcome, po
             assert end["data"] is None
     finally:
         relay.guardrails.deregister_llm_sanitize_response("test.aux.payload")
+
+
+@pytest.mark.parametrize("provider", ["openai-codex", "xai-oauth"])
+def test_public_moa_native_bypass_retains_full_capture(capture, monkeypatch, provider):
+    events, _, _ = capture
+    calls = []
+    response = {
+        "id": "native", "model": "model", "status": "completed",
+        "output": [{"type": "message", "role": "assistant", "content": [
+            {"type": "output_text", "text": "native-result"}]}],
+        "vendor_extension": "native-only",
+    }
+
+    def create(**kwargs):
+        calls.append(kwargs)
+        from tests.agent.test_relay_auxiliary_stream_boundaries import ns
+        return iter([
+            ns({"type": "response.output_item.done", "output_index": 0, "item": response["output"][0]}),
+            ns({"type": "response.completed", "response": response}),
+        ])
+
+    native = NS(api_key="test", base_url="https://example.invalid", responses=NS(create=create))
+    client = aux.CodexAuxiliaryClient(native, "model")
+
+    def prepare(*args, **kwargs):
+        aux._set_relay_auxiliary_route(provider, "model", "codex_responses")
+        return NS(client=client, kwargs={"model": "model", "messages": kwargs["messages"]},
+                  request_provider=provider, resolved_api_mode="codex_responses"), {}, {}
+
+    monkeypatch.setattr(aux, "_plan_aux_call", prepare)
+    def wrong_stream(*args, **kwargs):
+        pytest.fail("Native MoA response entered caller-owned Chat stream seam")
+    monkeypatch.setattr(aux, "_relay_sync_stream", wrong_stream)
+    result = aux.call_llm("moa_aggregator", messages=[{"role": "user", "content": "native-input"}], stream=True)
+    assert result.choices[0].message.content == "native-result"
+    flush(events, "unused")
+    attempts = [e for e in events if e["category"] == "llm"]
+    assert len(calls) == 1 and len(attempts) == 2
+    assert attempts[0]["uuid"] == attempts[1]["uuid"]
+    assert "native-input" in json.dumps(attempts[0]["data"])
+    assert "native-only" in json.dumps(attempts[1]["data"])
+    logical = [e for e in events if e["name"] == relay_runtime.LOGICAL_LLM_SCOPE and e["scope_category"] == "end"]
+    assert len(logical) == 1 and logical[0]["data"]["outcome"] == "success"
