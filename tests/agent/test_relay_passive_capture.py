@@ -226,4 +226,3 @@ def test_guarded_stream_retains_observed_partial_without_replay(capture, outcome
         assert end["metadata"]["observed_error"]["message"] == str(error)
     assert "partial" in json.dumps(end["data"])
     assert end["metadata"]["outcome"] == outcome
-
