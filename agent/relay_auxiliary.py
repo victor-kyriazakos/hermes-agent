@@ -4,6 +4,10 @@ import contextlib
 from agent import relay_runtime
 
 
+class _ExplicitStreamClose(GeneratorExit):
+    """Cancellation signal owned exclusively by an explicit returned-stream close."""
+
+
 def call_with_stream_lifetime(scope, callback):
     """Detach a returned stream's scope from the caller's ContextVar stack."""
     import contextvars
@@ -62,7 +66,7 @@ class _ScopedStream:
             self._finish(exc)
             raise
         else:
-            self._finish(GeneratorExit())
+            self._finish(_ExplicitStreamClose())
 
     def __enter__(self):
         return self
@@ -92,7 +96,7 @@ def standalone_context(request_id):
         yield
     except BaseException as exc:
         from agent.relay_llm import _is_cancellation
-        outcome = "cancelled" if _is_cancellation(exc) else "failed"
+        outcome = "cancelled" if isinstance(exc, _ExplicitStreamClose) or _is_cancellation(exc) else "failed"
         raise
     finally:
         coordinator.end_turn(turn, outcome=outcome)

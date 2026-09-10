@@ -86,7 +86,7 @@ def test_public_negotiation_then_outer_retry(capture, monkeypatch, asynchronous)
 
 
 @pytest.mark.parametrize("native", [False, True])
-@pytest.mark.parametrize("outcome", ["success", "failed", "cancelled", "close"])
+@pytest.mark.parametrize("outcome", ["success", "failed", "cancelled", "close", "close_mid"])
 def test_public_standalone_stream_lifetime(tmp_path, monkeypatch, native, outcome):
     import nemo_relay as relay
     monkeypatch.setenv("HERMES_HOME", str(tmp_path / "profile"))
@@ -98,7 +98,7 @@ def test_public_standalone_stream_lifetime(tmp_path, monkeypatch, native, outcom
     try:
         error = aux.AuxiliaryExplicitCancellation() if outcome == "cancelled" else ValueError("wire failed")
         if native:
-            client, error = native_client("success" if outcome == "close" else outcome, calls)
+            client, error = native_client("success" if outcome.startswith("close") else outcome, calls)
         else:
             def chunks():
                 yield NS(choices=[NS(index=0, delta=NS(content="chunk"))])
@@ -121,7 +121,9 @@ def test_public_standalone_stream_lifetime(tmp_path, monkeypatch, native, outcom
                 assert not [e for e in events if e["name"] == relay_runtime.SESSION_SCOPE and e["scope_category"] == "end"]
                 if outcome == "success":
                     assert len(list(result)) == 1
-                elif outcome == "close":
+                elif outcome.startswith("close"):
+                    if outcome == "close_mid":
+                        next(result)
                     result.close()
                     result.close()
                 else:
@@ -132,10 +134,45 @@ def test_public_standalone_stream_lifetime(tmp_path, monkeypatch, native, outcom
         assert not host._sessions
         logical = [e for e in events if e["name"] == relay_runtime.LOGICAL_LLM_SCOPE and e["scope_category"] == "end"]
         assert len(logical) == 1
-        expected = ("success" if native else "cancelled") if outcome == "close" else outcome
+        expected = ("success" if native else "cancelled") if outcome.startswith("close") else outcome
         assert logical[0]["data"]["outcome"] == expected
+        turns = [e for e in events if e["name"] == relay_runtime.TURN_SCOPE and e["scope_category"] == "end"]
+        assert len(turns) == 1
+        assert turns[0]["data"]["outcome"] == expected
     finally:
         relay.subscribers.deregister("test.public")
+        relay_runtime._reset_for_tests()
+
+
+@pytest.mark.parametrize("during_close", [False, True])
+def test_standalone_unrelated_generator_exit_is_not_cancellation(tmp_path, monkeypatch, during_close):
+    import nemo_relay as relay
+    from agent.relay_auxiliary import call_with_stream_lifetime, standalone_context
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "profile"))
+    relay_runtime._reset_for_tests()
+    host = relay_runtime.get_runtime()
+    host.retain_managed_execution("test.unrelated")
+    events = []
+    relay.subscribers.register("test.unrelated", lambda e: events.append(json.loads(e.to_json())))
+    error = GeneratorExit("unrelated provider failure")
+    class Stream:
+        def __next__(self):
+            raise error
+        def close(self):
+            raise error
+    try:
+        stream = call_with_stream_lifetime(standalone_context("unrelated"), Stream)
+        with pytest.raises(GeneratorExit) as raised:
+            stream.close() if during_close else next(stream)
+        assert raised.value is error
+        flush(events, "unused")
+        turns = [e for e in events if e["name"] == relay_runtime.TURN_SCOPE and e["scope_category"] == "end"]
+        assert len(turns) == 1
+        assert turns[0]["data"]["outcome"] == "failed"
+        assert not host._sessions
+        assert relay_runtime.current_turn() is None
+    finally:
+        relay.subscribers.deregister("test.unrelated")
         relay_runtime._reset_for_tests()
 
 
