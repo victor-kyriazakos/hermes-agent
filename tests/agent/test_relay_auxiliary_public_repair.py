@@ -102,7 +102,9 @@ def test_public_standalone_stream_lifetime(tmp_path, monkeypatch, native, outcom
         else:
             def chunks():
                 yield NS(choices=[NS(index=0, delta=NS(content="chunk"))])
-                if outcome not in {"success", "close"}: raise error
+                if outcome == "close_mid":
+                    yield NS(choices=[NS(index=0, delta=NS(content="pending"))])
+                if not (outcome == "success" or outcome.startswith("close")): raise error
             def create(**kwargs):
                 calls.append(kwargs)
                 return chunks()
