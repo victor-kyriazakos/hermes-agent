@@ -594,22 +594,14 @@ class ManagedLlmStream(Iterator[Any]):
             return
         self._closed = True
         self._prefetched_chunks.clear()
-        if self._passive_capture is not None:
-            capture, self._passive_capture = self._passive_capture, None
-            record, self._passive_record = self._passive_record, None
-            record["outcome"] = logical_outcome
-            record["error"] = self._callback_error
-            response = self.final_response
-            if response is None:
-                response = relay_runtime._warn_on_error("passive stream snapshot", self._finalizer)
-            record["response"] = _jsonable(response)
-            capture.__exit__(None, None, None)
-            self._logical = None
         try:
             loop, self._loop = self._loop, None
             if loop is None:
+                # Close provider resources before publishing the passive record so a
+                # teardown failure is reflected in the END event rather than lost.
                 self._close_provider_resources()
-            else:
+            self._publish_passive(logical_outcome)
+            if loop is not None:
                 try:
                     _aclose_on_loop(loop, self._stream)
                 except Exception as exc:
@@ -619,6 +611,27 @@ class ManagedLlmStream(Iterator[Any]):
                 self._close_loop(loop)
         finally:
             self._release_runtime_lease()
+
+    def _publish_passive(self, logical_outcome: str) -> None:
+        if self._passive_capture is None:
+            return
+        capture, self._passive_capture = self._passive_capture, None
+        record, self._passive_record = self._passive_record, None
+        error = self._callback_error
+        if error is None and self._close_error is not None:
+            # Provider teardown was the first error of this call. A consumer-initiated
+            # close stays cancelled; anything else (natural exhaustion) is a failed call.
+            error = self._close_error
+            if logical_outcome != "cancelled":
+                logical_outcome = "failed"
+        record["outcome"] = logical_outcome
+        record["error"] = error
+        response = self.final_response
+        if response is None:
+            response = relay_runtime._warn_on_error("passive stream snapshot", self._finalizer)
+        record["response"] = _jsonable(response)
+        capture.__exit__(None, None, None)
+        self._logical = None
 
     def _release_runtime_lease(self) -> None:
         lease, self._runtime_lease = self._runtime_lease, None

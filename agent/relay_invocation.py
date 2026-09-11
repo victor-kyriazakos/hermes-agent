@@ -105,9 +105,13 @@ class _PhysicalStream:
             self.record['error'] = error
             outcome = 'cancelled' if relay_llm._is_cancellation(error) else 'failed'
         elif close_error is not None:
-            # Teardown of a cleanly closed stream failed. Record the teardown error but
-            # keep the consumer's outcome (cancelled): the provider call itself did not fail.
             self.record['error'] = close_error
+            if outcome != 'cancelled':
+                # Natural exhaustion (or any non-cancel close) whose teardown raises: the
+                # provider's close() failure IS the first provider error for this call.
+                outcome = 'failed'
+            # Consumer-initiated close: keep 'cancelled'. The provider call itself did not
+            # fail; only its teardown did, and the error is still recorded and re-raised.
         self.record['outcome'] = outcome
         self.record['response'] = relay_llm._jsonable(relay_runtime._warn_on_error(
             'invocation final capture', self.accumulator.finalize))

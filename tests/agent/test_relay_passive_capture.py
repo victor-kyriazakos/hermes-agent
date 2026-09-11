@@ -226,3 +226,54 @@ def test_guarded_stream_retains_observed_partial_without_replay(capture, outcome
         assert end["metadata"]["observed_error"]["message"] == str(error)
     assert "partial" in json.dumps(end["data"])
     assert end["metadata"]["outcome"] == outcome
+
+
+@pytest.mark.parametrize("consumer_close", [False, True])
+def test_guarded_stream_raising_provider_close_publishes_correct_outcome(capture, consumer_close):
+    """Composed passive path: a provider iterator whose close() raises. After natural EOF
+    that teardown failure is the invocation's first error -> END outcome failed/ERROR with
+    observed_error. On a consumer-initiated close the invocation stays cancelled/UNSET with
+    the error recorded. Consumer-visible raising keeps the existing ManagedLlmStream policy:
+    retained teardown errors surface on explicit close(), natural exhaustion completes."""
+    events, lease, _turn = capture
+    teardown = ValueError("wire failed on close")
+
+    class RaisingClose:
+        def __init__(self):
+            self.chunks = iter([{"delta": "partial"}, {"delta": "tail"}])
+            self.closed = 0
+        def __iter__(self):
+            return self
+        def __next__(self):
+            return next(self.chunks)
+        def close(self):
+            self.closed += 1
+            raise teardown
+
+    raw = RaisingClose()
+
+    def tool(args):
+        stream = relay_llm.stream_current(
+            {"stream": True}, lambda request: raw, name="nested-stream", model_name="synthetic",
+            finalizer=lambda: {"chunks": ["partial"]}, on_chunk=lambda c: None,
+            metadata={"api_request_id": "Stream-Request"})
+        assert next(stream) == {"delta": "partial"}
+        if consumer_close:
+            stream.close()
+        else:
+            list(stream)
+        return "done"
+
+    if consumer_close:
+        with pytest.raises(ValueError) as raised:
+            relay_tools.execute("stream-tool", {}, tool, session_id=lease.session_id)
+        assert raised.value is teardown
+    else:
+        relay_tools.execute("stream-tool", {}, tool, session_id=lease.session_id)
+    assert raw.closed == 1
+    attempts = flush(events, "nested-stream")
+    end = next(e for e in attempts if e["scope_category"] == "end")
+    expected = "cancelled" if consumer_close else "failed"
+    assert end["metadata"]["outcome"] == expected
+    assert end["metadata"]["otel.status_code"] == ("UNSET" if consumer_close else "ERROR")
+    assert end["metadata"]["observed_error"]["message"] == str(teardown)

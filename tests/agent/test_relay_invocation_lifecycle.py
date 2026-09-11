@@ -193,6 +193,26 @@ def test_consumer_close_with_raising_provider_close_stays_cancelled():
     assert raw.closed == 1
 
 
+def test_natural_exhaustion_with_raising_provider_close_is_failed():
+    """Natural EOF followed by a raising provider close(): the teardown failure is the first
+    provider error for this call, so the invocation is failed (not success) and the error
+    surfaces to the consumer."""
+    record = {}
+    class Context:
+        def __exit__(self, *args):
+            pass
+    teardown = ValueError('wire failed on close')
+    raw = Raw(close_error=teardown)
+    stream = invocation._PhysicalStream(raw, Context(), record, Accumulator())
+    next(stream)
+    with pytest.raises(ValueError) as raised:
+        next(stream)  # provider exhausted -> close(outcome='success') -> teardown raises
+    assert raised.value is teardown
+    assert record['outcome'] == 'failed'
+    assert record['error'] is teardown
+    assert raw.closed == 1
+
+
 def test_managed_consumer_failure_does_not_relabel_completed_invocation(capture):
     events, lease, _ = capture
     failure = TimeoutError('managed consumer deadline')
