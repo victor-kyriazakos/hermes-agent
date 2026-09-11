@@ -101,16 +101,20 @@ class _PhysicalStream:
                 close()
         except BaseException as exc:
             close_error = exc
-            if error is None:
-                error = exc
         if error is not None:
             self.record['error'] = error
             outcome = 'cancelled' if relay_llm._is_cancellation(error) else 'failed'
+        elif close_error is not None:
+            # Teardown of a cleanly closed stream failed. Record the teardown error but
+            # keep the consumer's outcome (cancelled): the provider call itself did not fail.
+            self.record['error'] = close_error
         self.record['outcome'] = outcome
         self.record['response'] = relay_llm._jsonable(relay_runtime._warn_on_error(
             'invocation final capture', self.accumulator.finalize))
         relay_runtime._warn_on_error('invocation capture exit', self.context.__exit__, None, None, None)
-        if close_error is not None and error is close_error:
+        # Surface a teardown failure only when the consumer is not already unwinding
+        # its own error (that one is re-raised by the consumer and must not be masked).
+        if close_error is not None and error is None:
             raise close_error
 
 

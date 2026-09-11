@@ -172,6 +172,27 @@ def test_consumer_failure_captures_partial_and_preserves_error():
     assert raw.closed == 1
 
 
+def test_consumer_close_with_raising_provider_close_stays_cancelled():
+    """A clean consumer-initiated close is a cancellation even when the provider's own
+    close() raises during teardown; the teardown error is recorded and re-raised, but it
+    must not relabel the invocation as failed."""
+    record = {}
+    class Context:
+        def __exit__(self, *args):
+            pass
+    teardown = ValueError('wire failed on close')
+    raw = Raw(close_error=teardown)
+    stream = invocation._PhysicalStream(raw, Context(), record, Accumulator())
+    next(stream)
+    with pytest.raises(ValueError) as raised:
+        stream.close()
+    assert raised.value is teardown
+    assert record['outcome'] == 'cancelled'
+    assert record['error'] is teardown
+    assert record['response']['chunks'] == [{'partial': 'consumer-visible'}]
+    assert raw.closed == 1
+
+
 def test_managed_consumer_failure_does_not_relabel_completed_invocation(capture):
     events, lease, _ = capture
     failure = TimeoutError('managed consumer deadline')
