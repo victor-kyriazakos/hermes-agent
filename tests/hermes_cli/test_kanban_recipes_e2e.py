@@ -314,11 +314,15 @@ def test_same_card_review_changes_new_run_rereview_and_join(runtime, aliases):
         assert ids['join'] not in {r['task'] for r in tick['records']}
         for record in tick['records']:
             argv = record['argv']
+            # The worker argv may start with ``python -m hermes_cli.main`` (module form wins over
+            # PATH, #111569); inspect the hermes flags after ``-p`` so ``-m`` is the model flag.
+            argv = argv[argv.index('-p'):]
             assert argv[argv.index('-p') + 1] == record['assignee']
             assert argv[argv.index('-m') + 1] == record['model'] == 'fixture-model'
             assert argv[argv.index('--provider') + 1] == record['provider'] == 'fixture-provider'
             assert argv[argv.index('--reasoning') + 1] == record['reasoning'] == 'high'
-            assert 'github-code-review' in argv and '--cli' in argv and '-Q' in argv
+            # Workers run ``--cli`` without ``-Q`` since 3187d68b49 (the live tool feed stays in the worker log).
+            assert 'github-code-review' in argv and '--cli' in argv and '-Q' not in argv
             assert record['goal_mode'] and record['goal_max_turns'] == 7
             assert record['pid'] in {w['pid'] for w in tick['workers']}
             assert record['run'] in {w['run'] for w in tick['workers']}
