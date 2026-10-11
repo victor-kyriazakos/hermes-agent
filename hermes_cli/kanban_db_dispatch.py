@@ -2048,6 +2048,9 @@ def _dispatch_lane_task(
     # it by assigning a profile, and health telemetry suppresses "stuck" for it.
     profile_exists = _profile_exists_fn()
     if profile_exists is not None and not profile_exists(assignee):
+        if not dry_run:
+            from hermes_cli.kanban_recipes_runtime import block_missing_profile
+            block_missing_profile(conn, task_id, assignee)
         result.skipped_nonspawnable.append(task_id)
         # Per-task diagnostic so ``show``/``tail`` name the missing profile instead of leaving
         # the card in ``ready`` with zero board evidence (#122422). Unlike a respawn guard the
