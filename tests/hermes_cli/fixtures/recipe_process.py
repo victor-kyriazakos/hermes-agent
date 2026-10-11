@@ -104,8 +104,10 @@ def worker(options):
             assert routed == 'default'
         else:
             assert action == 'complete'
-            # A stale owner must not complete the current run.
-            assert not kb.complete_task(conn, task_id, expected_run_id=run_id + 100000)
+            # A stale owner must not complete the current run. It carries a summary so the
+            # run-id fence is what refuses it, not the empty-evidence gate (#117483).
+            assert not kb.complete_task(conn, task_id, summary='Stale owner completion',
+                                        expected_run_id=run_id + 100000)
             ok = kb.complete_task(conn, task_id, summary='Harmless local child completed',
                                   expected_run_id=run_id)
         assert ok
