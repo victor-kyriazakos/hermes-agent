@@ -102,6 +102,22 @@ class TestResolveWorktreeBase:
         assert (base_ref, label) == ("origin/main", "origin/main (fetched)")
         assert _run(["git", "rev-parse", base_ref], narrow).stdout.strip() == remote_head
 
+    def test_feature_branch_upstream_vs_prefer_default_branch(self, remote_and_clone):
+        """``hermes -w`` follows the checked-out branch's upstream (step 1); kanban's
+        ``prefer_default_branch=True`` skips it and lands on the remote default branch."""
+        clone, remote_head, _ = remote_and_clone
+        _run(["git", "checkout", "-q", "-b", "feature"], clone)
+        _commit(clone, "feature.txt", "feature work")
+        _run(["git", "push", "-q", "-u", "origin", "feature"], clone)
+
+        assert worktree_ops._resolve_worktree_base(str(clone))[0] == "origin/feature"
+        # The freshness window is ref-agnostic: age the feature fetch so main is refetched.
+        old = time.time() - 3600
+        os.utime(Path(clone) / ".git" / "FETCH_HEAD", (old, old))
+        base_ref, label = worktree_ops._resolve_worktree_base(str(clone), prefer_default_branch=True)
+        assert (base_ref, label) == ("origin/main", "origin/main (fetched)")
+        assert _run(["git", "rev-parse", base_ref], clone).stdout.strip() == remote_head
+
     def test_falls_back_to_head_without_remote(self, tmp_path):
         repo = tmp_path / "no-remote"
         repo.mkdir()

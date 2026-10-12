@@ -18,7 +18,7 @@ from typing import Optional
 from typing import TYPE_CHECKING
 import contextlib
 
-from hermes_cli.worktree_ops import release_lsp_clients
+from hermes_cli.worktree_ops import _resolve_worktree_base, release_lsp_clients
 
 if TYPE_CHECKING:
     from hermes_cli.kanban_db import Task
@@ -686,8 +686,45 @@ def _repo_root_for_worktree_target(path: Path) -> Optional[Path]:
         current = current.parent
 
 
+def _worktree_sync_enabled() -> bool:
+    """``worktree_sync: false`` (shared with ``hermes -w`` / ``/worktree new``) keeps local HEAD."""
+    try:
+        from hermes_cli.config import load_config_readonly
+        return bool(load_config_readonly().get("worktree_sync", True))
+    except OSError:  # an unreadable config.yaml is handled inside load_config; this is HERMES_HOME I/O
+        _kb._log.warning("kanban worktree: could not read worktree_sync; assuming true", exc_info=True)
+        return True
+
+
+def _new_task_branch_base(repo_root: Path, branch_name: str) -> str:
+    """Base ref for a NEW task branch: the fetched remote default branch, not the checkout's HEAD.
+
+    A main checkout parked on a feature branch would otherwise hand every new task that
+    branch's history. Same resolver and fetch policy as ``hermes -w``, minus its
+    current-branch-upstream step (a feature branch's upstream is still not main).
+    """
+    if not _worktree_sync_enabled():
+        _kb._log.info("kanban worktree: new branch %s based on HEAD (local — worktree_sync disabled)",
+                      branch_name)
+        return "HEAD"
+    base_ref, label = _resolve_worktree_base(str(repo_root), prefer_default_branch=True)
+    if base_ref == "HEAD":
+        _kb._log.warning(
+            "kanban worktree: new branch %s based on the checkout's local HEAD, not the remote "
+            "default branch: %s", branch_name, label,
+        )
+    else:
+        _kb._log.info("kanban worktree: new branch %s based on %s", branch_name, label)
+    return base_ref
+
+
 def _ensure_git_worktree(repo_root: Path, target: Path, branch_name: str) -> None:
-    """Materialize ``target`` as a linked git worktree under ``repo_root``."""
+    """Materialize ``target`` as a linked git worktree under ``repo_root``.
+
+    An existing ``branch_name`` is reattached at its own tip (never moved); a new one starts
+    from :func:`_new_task_branch_base` with no upstream, so a worker's bare ``git push`` or
+    ``git pull`` cannot reach the default branch.
+    """
     target = target.expanduser()
     repo_common = _git_common_dir(repo_root)
     if target.exists() and repo_common is not None and _path_key(_git_common_dir(target)) == _path_key(repo_common):
@@ -696,7 +733,8 @@ def _ensure_git_worktree(repo_root: Path, target: Path, branch_name: str) -> Non
     if _git_branch_exists(repo_root, branch_name):
         args = ["worktree", "add", str(target), branch_name]
     else:
-        args = ["worktree", "add", "-b", branch_name, str(target), "HEAD"]
+        base_ref = _new_task_branch_base(repo_root, branch_name)
+        args = ["worktree", "add", "--no-track", "-b", branch_name, str(target), base_ref]
     result = _git(repo_root, *args, timeout=60)
     if result.returncode != 0:
         stderr = (result.stderr or result.stdout or "").strip()

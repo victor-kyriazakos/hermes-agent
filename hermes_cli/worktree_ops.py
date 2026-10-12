@@ -210,7 +210,8 @@ def _maintain_pack_health(repo_root: str) -> None:
 
 
 def _resolve_worktree_base(repo_root: str, fetch_timeout: float = 5,
-                           freshness_window: float = 300) -> tuple:
+                           freshness_window: float = 300, *,
+                           prefer_default_branch: bool = False) -> tuple:
     """Resolve the freshest base ref to branch a new worktree from -> ``(base_ref, banner_label)``.
 
     Local ``HEAD`` can lag the remote by hundreds of commits, so try in order: (1) the current
@@ -218,6 +219,9 @@ def _resolve_worktree_base(repo_root: str, fetch_timeout: float = 5,
     (3) local ``HEAD``. The fetch is skipped when ``FETCH_HEAD`` is younger than
     *freshness_window* s, capped at *fetch_timeout*, and never retried: on failure the cached
     remote-tracking ref is used (the pre-push stale-base gate backstops genuine staleness).
+
+    *prefer_default_branch* skips step (1): a kanban task is new work on top of the default
+    branch, and a checkout parked on a feature branch must not lend it that branch's upstream.
     """
     from hermes_cli._subprocess_compat import noninteractive_git_env
     from hermes_cli.update_cmd_check import tracking_refspec
@@ -264,8 +268,9 @@ def _resolve_worktree_base(repo_root: str, fetch_timeout: float = 5,
 
     # 1. Current branch's upstream, if it tracks one.
     try:
-        up = _run(["rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{upstream}"])
-        if up.returncode == 0:
+        up = (None if prefer_default_branch
+              else _run(["rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{upstream}"]))
+        if up is not None and up.returncode == 0:
             upstream = up.stdout.strip()
             if upstream and "/" in upstream:
                 remote, branch = upstream.split("/", 1)
