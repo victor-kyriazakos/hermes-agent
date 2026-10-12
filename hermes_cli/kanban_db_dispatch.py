@@ -2492,24 +2492,22 @@ def _module_hermes_argv() -> list[str]:
     return [sys.executable, "-m", "hermes_cli.main"]
 
 
-def _propagate_module_import_root(cmd: list[str], env: dict[str, str]) -> None:
-    """Put the running install's package root on a module-form worker's path.
+def _propagate_module_import_root(cmd: list[str], env: dict[str, str]) -> list[str]:
+    """Pin a module-form worker's imports to the running install -> the argv to spawn.
 
-    ``_resolve_hermes_argv`` proves ``hermes_cli`` importable in THIS process,
-    where a store-python shim has the repo root on ``sys.path`` in-process;
-    the spawned child runs the bare ``sys.executable`` from the task workspace
-    with a scrubbed ``PYTHONPATH`` and cannot import the package the parent
-    just proved importable — it dies before any work and the board
-    auto-blocks (#122299, #122487, #122500). Same-interpreter child, so the
-    root is version-safe to propagate; ``hermes_cli.main``'s own bootstrap
-    then owns dependency activation as usual. A resolved shim path owns its
-    imports and is left alone. Same pin cron's external worker uses (#112729).
+    The child runs bare ``sys.executable`` with a scrubbed ``PYTHONPATH``: pin the root that
+    made ``hermes_cli`` importable here (#122299, #122487, #122500; cron's pin, #112729).
+    ``-P`` (3.11+, the floor) stops ``-m`` putting the cwd, the task workspace, first on
+    ``sys.path``: a hermes-agent worktree shadowed the install and the worker ran the TARGET's
+    code. A flag, not ``PYTHONSAFEPATH``, which would leak into the worker's terminal commands.
+    A resolved shim path owns its imports and is left alone.
     """
     if cmd[1:3] != ["-m", "hermes_cli.main"]:
-        return
+        return cmd
     from cron.scheduler_worker_env import pin_hermes_tree_on_pythonpath
 
     pin_hermes_tree_on_pythonpath(env, Path(__file__).resolve().parents[1])
+    return [cmd[0], "-P", *cmd[1:]]
 
 
 def _absolute_hermes_path(path: str) -> str:
@@ -2936,8 +2934,9 @@ def _default_spawn(task: Task, workspace: str, *, board: Optional[str] = None) -
 
     cmd = _worker_argv(task, profile_arg, env.get("HERMES_HOME"))
     # The module argv must carry the import context that made it resolvable:
-    # the shim's in-process path injection is invisible to the bare child.
-    _propagate_module_import_root(cmd, env)
+    # the shim's in-process path injection is invisible to the bare child, and
+    # the task workspace (its cwd) must never shadow the install.
+    cmd = _propagate_module_import_root(cmd, env)
     # A worker spawned by a managed systemd gateway must leave the gateway's
     # cgroup before startup; otherwise restarting the service kills the worker
     # that is performing the handoff.
