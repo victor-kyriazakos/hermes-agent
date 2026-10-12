@@ -21,7 +21,7 @@ from pathlib import Path
 
 from agent.i18n import t
 from gateway.config import Platform
-from gateway.platforms.base import EphemeralReply
+from gateway.platforms.reply_types import EphemeralReply
 from gateway.platforms.event import MessageEvent, MessageType
 from gateway.run_busy import approval_input_words
 from gateway.run_common import _UNSET

@@ -28,9 +28,9 @@ import pytest
 from gateway.config import Platform, PlatformConfig
 from gateway.platforms.base import (
     BasePlatformAdapter,
-    EphemeralReply,
     SendResult,
 )
+from gateway.platforms.reply_types import EphemeralReply
 from gateway.platforms.event import MessageEvent, MessageType
 from gateway.session import SessionSource
 

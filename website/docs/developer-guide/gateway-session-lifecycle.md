@@ -369,7 +369,9 @@ one of two things:
   delivery would have judged it: a bare silence marker (`[SILENT]`, `NO_REPLY`, ...) on an
   internal turn, or the reply to a diagnostic wake the chat's policy mutes, is owed nothing
   (the marker is cleared, nothing is sent or resumed). A human turn's bare silence marker
-  becomes the same "returned only a silence marker" notice the live path sends.
+  becomes the same "returned only a silence marker" notice the live path sends; in a shared
+  chat the row keeps the sender as `private_recipient`, so the sweep delivers it privately
+  where the adapter can (Slack ephemeral) and publicly only as a fallback.
 - **No reply was persisted.** `recover_interrupted_turns()` sets `resume_pending=True`,
   `resume_reason="restart_interrupted"`, and the turn auto-resumes once.
 

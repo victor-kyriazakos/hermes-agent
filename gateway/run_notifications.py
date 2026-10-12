@@ -20,7 +20,7 @@ from typing import Any, Dict, Optional, cast
 
 from agent.i18n import t
 from gateway.config import Platform, _BUILTIN_PLATFORM_VALUES
-from gateway.platforms.base import BasePlatformAdapter, _mark_notify_metadata
+from gateway.platforms.base import BasePlatformAdapter, SenderOnlyNotice, _mark_notify_metadata, keep_sender_only
 from gateway.platforms.event import MessageEvent, MessageType
 from gateway.session import SessionEntry, SessionSource, SessionStore
 from gateway.run_shutdown import _delivery_target_key, _log_suppressed, _notice_target_key, _send_error, _send_failed
@@ -293,12 +293,12 @@ class GatewayNotificationsMixin(GatewayNotificationOwnershipMixin):
         DECLINE returns True: that destination is not approved and must not be re-sent."""
         from gateway.run import _strip_response_attachments_for_direct_send
         if not text_already_delivered:
-            text_content = _strip_response_attachments_for_direct_send(response, adapter)
+            text_content = keep_sender_only(response, _strip_response_attachments_for_direct_send(response, adapter))
             if text_content:
-                # Reconcile-by-edit first: a stream-sealed message already carries most of the answer;
-                # a plain send here would duplicate it.
+                # Reconcile-by-edit first (a plain send would duplicate a stream-sealed answer); never for
+                # a sender-only notice, which editing a message the whole chat sees would publish.
                 _reconciled = False
-                _sc_msg_id = getattr(stream_consumer, "message_id", None)
+                _sc_msg_id = None if isinstance(text_content, SenderOnlyNotice) else getattr(stream_consumer, "message_id", None)
                 if (
                     _sc_msg_id
                     and _sc_msg_id != "__no_edit__"

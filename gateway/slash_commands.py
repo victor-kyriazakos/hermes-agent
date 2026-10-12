@@ -21,7 +21,7 @@ from typing import Optional, Union
 
 from agent.i18n import t
 from gateway.config import HomeChannel, Platform, PlatformConfig, persist_home_channel
-from gateway.platforms.base import EphemeralReply
+from gateway.platforms.reply_types import EphemeralReply
 from gateway.platforms.event import MessageEvent
 from gateway.session import AsyncSessionStore
 from gateway.session_transcript import TranscriptReadError

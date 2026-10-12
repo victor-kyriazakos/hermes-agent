@@ -429,6 +429,7 @@ from gateway.platforms.base_exec_approval import (
     approval_timeout_seconds, ea_action_labels, ea_default_reason_text, ea_header_text,
     ea_reason_label_text, ea_smart_deny_line_text, format_approval_deadline_line)
 from gateway.platforms.event import MessageEvent, MessageType, ProcessingOutcome
+from gateway.platforms.reply_types import EphemeralReply, SenderOnlyNotice, keep_sender_only, send_sender_only_notice
 from gateway.warning_notifications import diagnostic_wake_muted
 from hermes_cli.observability.shared_metrics_gateway import records_delivery, stop_reply_clock
 from gateway.session import SessionSource, build_session_key
@@ -1780,24 +1781,6 @@ def is_chat_level_not_found(exc: Optional[BaseException] = None, error_text: str
     blob = _error_blob(exc, error_text)
     return (not _any_in(blob, *_SUBCHAT_NOT_FOUND_SUBSTRINGS)
             and _any_in(blob, *_CHAT_LEVEL_NOT_FOUND_SUBSTRINGS))
-
-
-class EphemeralReply(str):
-    """System-notice reply that auto-deletes after ``ttl_seconds`` on platforms implementing
-    ``delete_message`` (others leave it). ``None`` ttl uses ``display.ephemeral_system_ttl``
-    (``0`` disables globally). Subclassing ``str`` keeps it transparent to everything that
-    treats handler results as text; ``isinstance`` lets the send path schedule deletion."""
-    ttl_seconds: Optional[int]
-
-    def __new__(cls, text: str, ttl_seconds: Optional[int] = None):
-        instance = super().__new__(cls, text)
-        instance.ttl_seconds = ttl_seconds
-        return instance
-
-    @property
-    def text(self) -> str:
-        """The underlying text (explicit form of ``str(reply)``)."""
-        return str.__str__(self)
 
 
 def merge_pending_message_event(pending_messages: dict[str, MessageEvent], session_key: str,
@@ -4269,7 +4252,9 @@ class BasePlatformAdapter(ABC):
                 platform=str(getattr(source.platform, "value", source.platform)),
                 chat_id=source.chat_id, thread_id=getattr(source, "thread_id", None),
                 content=text_content,
-                adapter_profile=getattr(delivery_adapter, "_owner_profile", None))
+                adapter_profile=getattr(delivery_adapter, "_owner_profile", None),
+                private_recipient=text_content.user_id
+                if isinstance(text_content, SenderOnlyNotice) else None)
             await asyncio.to_thread(mark_attempting, obligation_id)
             return obligation_id
         except Exception:
@@ -4393,8 +4378,10 @@ class BasePlatformAdapter(ABC):
             event, session_key, text_content, delivery_adapter, is_ephemeral_response)
         if obligation_id is not None:
             await self._release_turn_marker(event)  # the ledger now owns the crash recovery
-        result = await delivery_adapter._send_with_retry(
-            chat_id=event.source.chat_id, content=text_content, reply_to=reply_to, metadata=metadata)
+        result = await send_sender_only_notice(delivery_adapter, event.source.chat_id, text_content, metadata)
+        if result is None:
+            result = await delivery_adapter._send_with_retry(
+                chat_id=event.source.chat_id, content=text_content, reply_to=reply_to, metadata=metadata)
         stop_reply_clock(delivery_adapter, event.source.chat_id, result)
         if obligation_id is not None:
             await self._finalize_delivery_obligation(obligation_id, result, event, delivery_adapter)
@@ -4595,7 +4582,9 @@ class BasePlatformAdapter(ABC):
             else:
                 extracted = await self._extract_response_content(
                     response, event, session_key, is_ephemeral_response=is_ephemeral_response)
-                text_content, media_files = extracted.text_content, extracted.media_files
+                # Extraction returns plain text; a sender-only notice keeps its recipient.
+                text_content = keep_sender_only(response, extracted.text_content)
+                media_files = extracted.media_files
                 # Final content gets notify=True; typing metadata stays unmarked (thread-strict).
                 _final_thread_metadata = _mark_notify_metadata(_thread_metadata)
                 _tts_paths, _tts_requested_path = [], None

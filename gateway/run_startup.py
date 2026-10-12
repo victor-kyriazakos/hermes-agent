@@ -20,7 +20,7 @@ from pathlib import Path
 from agent.i18n import t
 from gateway.config import Platform
 from gateway.delivery import looks_like_telegram_private_chat_id
-from gateway.platforms.base import BasePlatformAdapter
+from gateway.platforms.base import BasePlatformAdapter, SenderOnlyNotice, send_sender_only_notice
 from gateway.platforms.event import MessageEvent, MessageType
 from gateway.session import SessionSource, build_session_key
 from gateway.restart import (
@@ -467,7 +467,13 @@ class GatewayStartupMixin:
                 content = row.get("marker", RECOVERED_MARKER) + content
             metadata = {"thread_id": row["thread_id"]} if row.get("thread_id") else None
             try:
-                result = await adapter.send(chat_id=row["chat_id"], content=content, metadata=metadata)
+                result = None
+                if row.get("private_recipient") and isinstance(adapter, BasePlatformAdapter):
+                    # A sender-only notice stays private on redelivery; public only as fallback.
+                    result = await send_sender_only_notice(
+                        adapter, row["chat_id"], SenderOnlyNotice(content, row["private_recipient"]), metadata)
+                if result is None:
+                    result = await adapter.send(chat_id=row["chat_id"], content=content, metadata=metadata)
             except Exception as send_err:
                 logger.warning("obligation %s: redelivery send raised: %s", row["obligation_id"], send_err)
                 result = None
@@ -778,7 +784,8 @@ class GatewayStartupMixin:
                     record_crash_left_reply,
                     obligation_id=compute_obligation_id(key, f"crash:{token}", text), session_key=key,
                     platform=str(getattr(origin.platform, "value", origin.platform)), chat_id=origin.chat_id,
-                    thread_id=origin.thread_id, content=text, since=started, adapter_profile=profile)
+                    thread_id=origin.thread_id, content=str(text), since=started, adapter_profile=profile,
+                    private_recipient=text.user_id if isinstance(text, SenderOnlyNotice) else None)
             if await self.async_session_store.clear_turn_active(key, token) and text:
                 ledgered += 1
         return ledgered
@@ -792,9 +799,9 @@ class GatewayStartupMixin:
         from gateway.platforms.base import _strip_media_directives
         from gateway.response_filters import (
             is_intentional_silence_response, is_machinery_display_kind, silence_allowed,
+            unexpected_silence_reply,
         )
         from gateway.run import _sanitize_gateway_final_response
-        from gateway.run_turn import _unexpected_silence_reply
         from gateway.warning_notifications import diagnostic_turn_muted
         from hermes_cli.timefmt import coerce_epoch
         visible = [m for m in history if m.get("role") not in ("session_meta", "system")]
@@ -815,7 +822,7 @@ class GatewayStartupMixin:
         if is_intentional_silence_response(last["content"]):
             silent_ok = silence_allowed(
                 prompt.get("display_kind"), (prompt.get("display_metadata") or {}).get("reply_expected"))
-            return "" if silent_ok else _unexpected_silence_reply()
+            return "" if silent_ok else unexpected_silence_reply(origin)
         return _strip_media_directives(_sanitize_gateway_final_response(origin.platform, last["content"])).strip() or None
 
     @staticmethod

@@ -134,6 +134,22 @@ def reply_expected_metadata(reply_expected: Optional[bool]) -> dict:
     return {} if reply_expected is None else {"reply_expected": reply_expected}
 
 
+def unexpected_silence_reply(source: Any = None, *, sender_id: Optional[str] = None) -> str:
+    """The notice for a human turn whose bare silence marker was rejected: the one decision for
+    every path that rejects it (live turn, queued follow-up, crash-left redelivery). In a shared
+    conversation (any non-DM ``source``) it is a ``SenderOnlyNotice`` for the sender (``sender_id``,
+    else ``source.user_id``), which the send path delivers privately where the adapter can and
+    publicly where it cannot. A DM, or no known sender, gets the plain notice as before."""
+    from agent.i18n import t
+    from gateway.platforms.reply_types import SenderOnlyNotice
+
+    text = t("gateway.errors.unexpected_silence")
+    recipient = sender_id or getattr(source, "user_id", None)
+    if source is None or getattr(source, "chat_type", "dm") == "dm" or not recipient:
+        return text
+    return SenderOnlyNotice(text, str(recipient))
+
+
 def is_partial_silence_marker(text: Any) -> bool:
     """True while streamed ``text`` could still resolve to a silence marker.
 

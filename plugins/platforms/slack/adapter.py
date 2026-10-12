@@ -2331,24 +2331,24 @@ class SlackAdapter(BasePlatformAdapter):
     async def send_private_notice(
         self, chat_id: str, user_id: str, content: str, reply_to: Optional[str] = None,
         metadata: Optional[dict[str, Any]] = None) -> SendResult:
-        """Send a Slack ephemeral message visible only to one user."""
+        """Slack ephemeral visible only to ``user_id``, in the thread when known, chunked like
+        ``_post_ephemeral_fallback``. Not ok or an error is a failed result, never a public post."""
         blocked = self._outbound_blocked(chat_id, "outbound generic ephemeral notice to")
         if blocked:
             return blocked
         if not chat_id or not user_id:
             return SendResult(success=False, error="chat_id and user_id are required")
+        thread = {"thread_ts": ts} if (ts := self._resolve_thread_ts(reply_to, metadata)) else {}
         try:
-            formatted = self.format_message(content)
-            thread_ts = self._resolve_thread_ts(reply_to, metadata)
-            kwargs = {"channel": chat_id, "user": user_id, "text": formatted, "mrkdwn": True}
-            if thread_ts:
-                kwargs["thread_ts"] = thread_ts
-            result = await self._client_for(chat_id, metadata).chat_postEphemeral(**kwargs)
-            return SendResult(
-                success=True, message_id=result.get("message_ts") or result.get("ts"),
-                raw_response=result)
-        except Exception as e:  # pragma: no cover - defensive logging
-            logger.error("[Slack] Ephemeral send error: %s", e, exc_info=True)
+            for chunk in self._format_chunks(content):
+                payload = _slack_response_payload(await self._client_for(chat_id, metadata).chat_postEphemeral(
+                    channel=chat_id, user=user_id, text=chunk, mrkdwn=True, **thread))
+                if not payload.get("ok"):
+                    return SendResult(success=False, error=f"chat.postEphemeral failed: {payload.get('error', 'unexpected_response')}")
+            await self._clear_thread_status_quietly(chat_id, metadata)  # an ephemeral leaves "is thinking..."
+            return SendResult(success=True, message_id=payload.get("message_ts"), raw_response=payload)
+        except Exception as e:  # a failed result: the caller decides whether to fall back publicly
+            logger.warning("[Slack] Ephemeral send error: %s", e, exc_info=True)
             return SendResult(success=False, error=str(e))
 
     async def send_or_update_status(

@@ -23,10 +23,11 @@ from contextlib import nullcontext, suppress
 from contextvars import copy_context
 from gateway.config import Platform
 from gateway.media_repair import repair_explicit_computer_use_media_paths
-from gateway.platforms.base import BasePlatformAdapter, ProcessingOutcome
+from gateway.platforms.base import BasePlatformAdapter, ProcessingOutcome, keep_sender_only
 from gateway.platforms.event import MessageEvent
 from gateway.response_filters import (
     display_kind_for_event, is_machinery_display_kind, reply_expected_metadata, silence_allowed,
+    unexpected_silence_reply as _unexpected_silence_reply,
 )
 from gateway.warning_notifications import diagnostic_metadata, diagnostic_turn_muted, diagnostic_wake_muted
 from gateway.session import (
@@ -83,11 +84,6 @@ _CONTEXT_OVERFLOW_ERROR_PHRASES = (
     "request entity too large", "prompt is too long",
     "payload too large", "input is too long",
 )
-
-def _unexpected_silence_reply() -> str:
-    """Reply when the model returned only a silence marker for a message that needed an answer."""
-    return t("gateway.errors.unexpected_silence")
-
 
 def _bg_prompt_preview(prompt: str, limit: int = 60) -> str:
     """Short single-line quote of a /bg prompt for its failure notice (the task id means nothing to the user)."""
@@ -1530,7 +1526,8 @@ class GatewayTurnMixin:
                 _platform_name, source.chat_id or "unknown",
             )
             _intentional_silence = False
-            response = _unexpected_silence_reply()
+            # A queued chain's terminal turn may come from another sender.
+            response = _unexpected_silence_reply(source, sender_id=agent_result.get("queued_terminal_user_id"))
         elif _intentional_silence and not is_machinery_display_kind(_silence_kind):
             logger.debug(
                 "silence marker suppressed on an unaddressed turn: platform=%s chat=%s",
@@ -1564,8 +1561,8 @@ class GatewayTurnMixin:
         # Normalize empty responses: surface errors, partial failures, and work-without-text.
         # Fix for #18765.
         if not _intentional_silence:
-            response = _normalize_empty_agent_response(agent_result, response, history_len=len(history))
-            response = _sanitize_gateway_final_response(source.platform, response)
+            _shaped = _normalize_empty_agent_response(agent_result, response, history_len=len(history))
+            response = keep_sender_only(response, _sanitize_gateway_final_response(source.platform, _shaped))
 
         # The agent thread already updated the contextvar; propagate to SessionEntry + _save() only
         # if the binding still points at the session this run was launched against.
@@ -2238,6 +2235,7 @@ class GatewayTurnMixin:
                 persist_user_display_kind=prepared.persist_user_display_kind,
                 reply_expected=event.reply_expected,
             )
+            _shaped_response = response  # a SenderOnlyNotice keeps its recipient past the text edits below
             response = self._hmwa_prepend_reasoning(agent_result, response, source, _intentional_silence)
             _footer_line = self._hmwa_runtime_footer_line(agent_result, source, _turn_seconds)
             # Streaming already delivered the body: the footer goes out as a trailing send instead.
@@ -2260,10 +2258,10 @@ class GatewayTurnMixin:
                 hidden_reasoning_incomplete=hidden_reasoning_incomplete,
                 is_context_overflow_failure=is_context_overflow_failure,
             )
-            return await self._hmwa_deliver_turn_response(
+            return keep_sender_only(_shaped_response, await self._hmwa_deliver_turn_response(
                 event, source, session_entry, session_key, run_generation,
                 agent_result, agent_messages, response, _footer_line, _intentional_silence,
-            )
+            ))
 
         except Exception as e:
             return await self._hmwa_agent_error_reply(e, event, source, session_entry, session_key, prepared)
@@ -3765,7 +3763,7 @@ class GatewayTurnMixin:
                     "Queued follow-up for session %s: replacing a human-turn silence marker.",
                     session_key or "?",
                 )
-                first_response = _unexpected_silence_reply()
+                first_response = _unexpected_silence_reply(turn_ctx.source)
                 _already_streamed = False
         # Failed turns deliver their text but never their attachments (completed-turn parity).
         _deliver_media = not _delivery_result.get("failed")
@@ -3970,6 +3968,7 @@ class GatewayTurnMixin:
                 "queued_terminal_inbound_id": next_inbound_id,
                 "queued_terminal_display_kind": next_display_kind,
                 "queued_terminal_reply_expected": next_reply_expected,
+                "queued_terminal_user_id": getattr(next_source, "user_id", None),
                 "queued_terminal_notification_category": (
                     (pending_event.metadata or {}).get("notification_category", "result")
                     if pending_event is not None and pending_event.internal else "result"),
