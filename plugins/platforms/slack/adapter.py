@@ -6401,15 +6401,15 @@ class SlackAdapter(BasePlatformAdapter):
         self, routing_text: str, bot_uid: Optional[str], *, channel_id: str, addressed: bool,
         opens_own_session: bool) -> Optional[bool]:
         """``MessageEvent.reply_expected`` for an admitted message. False (a bare silence marker may
-        stand) only when it opens by @mentioning someone else, or is an unaddressed message that a
-        free-response channel admitted as the start of its own session (a new top-level thread).
-        A plain follow-up in a conversation the bot is part of (a thread, or a flat
-        ``reply_in_thread: false`` channel) is None: it is usually meant for the bot, so the
-        gateway keeps its visible fallback (#110952)."""
+        stand) only when it @mentions someone other than this bot anywhere and never the bot (room
+        tokens like ``<!here>``/``<#C…>``/``<!subteam^…>`` are no person; not the admission gate's
+        leading-token rule), or is an unaddressed top-level message a free-response channel admitted
+        as its own session. Other follow-ups in a conversation the bot is part of (a thread, or a
+        flat ``reply_in_thread: false`` channel) are None: the visible fallback stays (#110952)."""
         self_uids = {u for u in (bot_uid, self._bot_user_id) if u}
         if addressed or self._slack_message_mentions_self(routing_text, self_uids):
             return True
-        if self._slack_message_addressed_to_other_user(routing_text, self_uids):
+        if any(uid not in self_uids for uid in re.findall(r"<@([^>|\s]+)[|>]", routing_text or "")):
             return False
         return False if opens_own_session and self._slack_is_free_channel(channel_id) else None
 
