@@ -331,10 +331,29 @@ tasks. Omit `task=` (or use `"auto"`) to keep the active main provider/model.
 
 #### Inheriting a built-in slot
 
-`inherit_from` names a built-in auxiliary task (`compression`, `mcp`,
-`vision`, ...) or a task your plugin (or one loaded before it) already
-registered. Your task then uses that slot's model until the operator pins
-one on your task directly:
+`inherit_from` names a built-in auxiliary task the model picker lists
+(`compression`, `mcp`, `vision`, `curator`, ...), `background_review`, or a
+task your plugin (or one loaded before it) already registered. Other core
+`auxiliary.*` blocks are not bases. Your task then uses that slot's model
+until the operator pins one on your task directly.
+
+**Following a built-in slot's model needs the operator's grant.** The
+slot's route (`provider`, `model`, `base_url`, `api_key`, `api_mode`, the
+key env, `reasoning_effort`, `extra_body`, `fallback_chain`) carries over
+only when the operator sets `allow_task_override` for your plugin, the
+same grant that lets `task=` name a built-in slot. Without it your task
+inherits the slot's other settings (such as `timeout`) and runs on its
+own route: your `defaults`, else the active main model. Declare it in
+your setup instructions when your task should follow the user's review or
+curator model:
+
+```yaml
+plugins:
+  entries:
+    my-plugin:
+      llm:
+        allow_task_override: true
+```
 
 ```python
 def register(ctx):
@@ -352,6 +371,9 @@ def register(ctx):
   classifier follows on its next call, per profile.
 - **Precedence:** the inherited base, then the plugin's `defaults`, then the
   operator's `auxiliary.<task>` block.
+- **A chain counts as its root.** Inheriting another plugin's task that
+  inherits a built-in slot carries that slot's route only when your plugin
+  holds the grant too.
 - **An operator pin wins as a whole route.** Once `auxiliary.classifier` sets a
   non-`auto` provider, a model or a `base_url`, the provider, model, endpoint,
   key and reasoning effort all come from that block; nothing from the base's
@@ -460,6 +482,7 @@ path-derived key for nested plugins (`image_gen/openai`,
 | `agent_id=`     | denied  | `allow_agent_id_override: true`  |
 | `profile=`      | denied  | `allow_profile_override: true`   |
 | built-in `task=` | denied  | `allow_task_override: true`      |
+| route inherited from a built-in slot | stripped | `allow_task_override: true` |
 
 Each override is independently gated. Granting `allow_model_override`
 does **not** also grant `allow_provider_override` — a plugin trusted
@@ -607,6 +630,139 @@ Observability plugins see the call as an auxiliary call:
 `aux_task="plugin_side_question"` and `plugin_id` set to the asking
 plugin, and the turn-scoped `pre_api_request` /
 `post_api_request` do not fire for it.
+
+## Forking the session's own agent (`ctx.fork_session`)
+
+`ctx.side_question` gets one text reply. `ctx.fork_session` runs a
+bounded background copy of the session's agent instead: the same
+system prompt, `tools[]`, memory and conversation, on the warm prompt
+cache, working through a multi-step prompt that may call the tools the
+plugin names. It is the pattern Hermes uses for its own background
+memory/skill review, opened to plugins. A typical use: after a turn
+that created or edited a skill, ask the fork whether the skill is worth
+sharing, and let it call the plugin's own tool that offers the share.
+
+```python
+import json
+import threading
+
+
+def register(ctx):
+    def offer_share(args, turn_origin=None, **kwargs):
+        if turn_origin != "plugin_fork:wisdom":
+            return json.dumps({"error": "only the background check may offer a share"})
+        ...  # present the approval card for args["skill"]
+        return json.dumps({"offered": True})
+
+    ctx.register_tool("wisdom_offer_share", "wisdom", OFFER_SCHEMA, offer_share)
+
+    def on_post_llm_call(side_question_token=None, review_signals=None, **kwargs):
+        if side_question_token is None or not (review_signals or {}).get("skill_review_due"):
+            return
+        handle = ctx.fork_session(
+            side_question_token,
+            "Did this session create or change a skill the team would benefit from? "
+            "If so, call wisdom_offer_share once for it; otherwise answer 'no'.",
+            tools=["wisdom_offer_share"], max_iterations=4)
+        if handle is not None:  # runs in the background; never wait inside the hook
+            threading.Thread(target=lambda: handle.wait(600) and ctx.state.set(
+                "last_check", handle.outcome), daemon=True).start()
+
+    ctx.register_hook("post_llm_call", on_post_llm_call)
+```
+
+```yaml
+capabilities:
+  - llm.session_fork
+```
+
+The consent screen shows: "Run a background copy of your agent after a
+turn. It sees the whole session, including memory, can use the agent's
+tools the plugin names, and spends your main model's tokens."
+
+### Signature and rules
+
+`ctx.fork_session(token, prompt, *, tools=(), max_iterations=8,
+input_budget=None, task=None, timeout=None)` returns a handle, or `None`
+when nothing was started.
+
+* `token` is `post_llm_call`'s `side_question_token`: the [lease
+  rules](#lease-rules) above apply unchanged. One token backs one request
+  per turn, a side question *or* a fork, shared by every plugin;
+  unattended turns (cron, subagents) get none; another profile's plugin
+  gets `None` and does not spend it. A plugin without `llm.session_fork`
+  gets `None` and does not spend it either, nor does a request naming an
+  agent-spawning tool (below); every other `None` spends it.
+* `prompt` is a non-empty string of at most **8192 characters**, sent as
+  the fork's user message. The system prompt and `tools[]` stay
+  byte-identical to the session's, so the first request is mostly cache
+  reads.
+* `tools` lists the tool names the fork may call. Each must already be
+  advertised to the session (a tool the plugin registered with
+  `register_tool` qualifies), else the call returns `None`. The fork still
+  *sees* every session tool (cache parity); calls outside the list are
+  refused at dispatch with a message naming the allowed tools. An empty
+  list means a tool-less fork.
+* A fork never holds a tool that starts another agent loop:
+  `delegate_task`, `message_agent`, `cronjob_manage`, and the Kanban
+  moves that hand a task to a dispatched worker (`kanban_create`,
+  `kanban_unblock`, `kanban_complete`, `kanban_request_review`,
+  `kanban_request_changes`). That loop would run outside the fork's tool
+  list and its auto-denied approvals. Naming one returns `None` without
+  spending the token, and the fork's dispatch refuses them however they
+  are reached. The background review's `extra_tools` ignores them too.
+* `max_iterations` caps the fork's loop (1 to 16). The fork's aggregate
+  input tokens are bounded like the background review's
+  (`auxiliary.background_review.max_input_tokens`, default 75% of the
+  context window); `input_budget` can only lower that bound.
+* Dangerous-command approvals are auto-denied, and nothing the fork does
+  is written to the transcript or the session database.
+* The fork is cancelled as soon as the session starts its next turn,
+  whether it is running, starting or still deferred; a deferred fork
+  then never launches. `timeout` (seconds, at most 1800) adds a wall
+  clock. Both are cooperative: they interrupt the fork, which stops at
+  its next interrupt check, and the handle settles when the fork's
+  worker exits. A provider call that ignores the interrupt holds the
+  handle open until it returns, so wait with a bound (`handle.wait(t)`).
+* `task` names one of this plugin's own
+  [`register_auxiliary_task`](#task-routed-auxiliary-calls) lanes: the
+  fork then runs on that lane's model, resolved like
+  `auxiliary.background_review` (a different model starts cache-cold and
+  sees a digest of the conversation). A task the plugin did not register
+  returns `None`. Without `task` the fork runs on the session's model. A
+  lane with `inherit_from="background_review"` follows the user's review
+  model only under `allow_task_override` ([Inheriting a built-in
+  slot](#inheriting-a-built-in-slot)).
+* On a runtime Hermes manages locally (the bundled llama-server), the fork
+  waits for the machine to go idle like the background review
+  (`outcome == "deferred"`); a newer deferred fork of the same plugin for
+  the same session replaces the queued one (`"superseded"`).
+
+### The handle
+
+`handle.done`, `handle.cancelled`, `handle.outcome`, `handle.result` (the
+fork's final text, or `None`), `handle.actions` (the whitelisted tool
+names it called, in order), `handle.wait(timeout)` and `handle.cancel()`.
+`outcome` is one of `deferred`, `running`, `ok`, `cancelled`,
+`superseded`, `timeout`, `budget_exhausted`, `error` or
+`refused:<reason>`: `parent_gone` (the session agent was released before
+the fork started), `moa` (a Mixture-of-Agents runtime), `agent_provider`
+(an agent-as-provider runtime that runs its own tools) or
+`runtime_changed` (the session switched model or provider since the
+turn). The handle never exposes the fork agent itself.
+
+### Telling a fork from the live agent
+
+A tool handler called inside the fork receives the keyword
+`turn_origin="plugin_fork:<plugin id>"` (declare it, or accept
+`**kwargs`); calls the live agent makes carry no `turn_origin`. The
+example above uses it so the live agent cannot fire the plugin's
+share-offer tool on its own.
+
+Usage is billed to the session as `plugin_fork:<plugin id>`. Each of the
+fork's provider requests fires `pre_auxiliary_call` /
+`post_auxiliary_call` with `aux_task="plugin_fork"` and `plugin_id`, never
+the turn-scoped `pre_api_request` / `post_api_request`.
 
 ## Where this fits in the plugin surface
 
