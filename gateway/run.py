@@ -576,16 +576,16 @@ def _redact_gateway_user_facing_secrets(text: str) -> str:
 
 
 def _redact_approval_command(cmd: str | None) -> str:
-    """Redact credentials from a command before it goes into an approval prompt.
+    """Redact credentials and surface hidden characters in a command before it goes into an approval prompt.
 
     The gateway approval prompt is built from the raw command string, so a credential-shaped value would
-    otherwise be echoed verbatim to the chat platform (#48456). Uses ``redact_sensitive_text(force=True)`` so
+    otherwise be echoed verbatim to the chat platform (#48456). Uses ``redact_approval_display(force=True)`` so
     the prompt honors redaction even when ``security.redact_secrets`` is off. Module-level so the wiring is
     unit-testable (the call site is a deeply nested gateway closure that cannot be driven directly).
     """
-    from agent.redact import redact_sensitive_text
+    from agent.redact import redact_approval_display
 
-    return redact_sensitive_text(str(cmd or ""), force=True)
+    return redact_approval_display(cmd, force=True)
 
 
 def _format_exec_approval_fallback(
@@ -1794,7 +1794,7 @@ def _load_profile_secret_scope(profile_home: Path) -> dict:
 @_contextmanager
 def _profile_runtime_scope(
     profile_home: Path, prepared_secret_scope: Optional[dict] = None, *,
-    hydrate_secrets: bool = True):
+    hydrate_secrets: bool = True, prepared_terminal_scope: Optional[dict] = None):
     """Scope config/skills/memory AND credentials to a profile for one turn (multiplexed path only).
     ``set_hermes_home_override`` is a contextvar (reaches the agent worker via ``copy_context()``);
     ``set_secret_scope`` makes the profile ``.env`` the credential source without mutating
@@ -1818,7 +1818,7 @@ def _profile_runtime_scope(
         # pinned (first-writer-wins backend leak; #68559).
         from tools.terminal_scope import install_and_reset_profile_terminal_scope
 
-        with install_and_reset_profile_terminal_scope(Path(profile_home)):
+        with install_and_reset_profile_terminal_scope(Path(profile_home), prepared=prepared_terminal_scope):
             yield
     finally:
         if secret_token is not None:
@@ -3708,12 +3708,6 @@ class GatewayRunner(
             restart_requested=self._restart_requested, active_agents=self._active_work_count(),
             active_work=active_work)
 
-    def _persist_active_agents(self) -> None:
-        """Persist the live in-flight agent count to ``gateway_state.json`` at every turn boundary.
-        Passes ONLY ``active_agents`` so the read-merge-write keeps lifecycle state (gateway_state=None
-        would clobber it). Best-effort: a failed write must never disrupt a turn."""
-        _write_runtime_status_quiet(active_agents=self._active_work_count())
-
     def _running_agent_ids(self) -> set:
         """``id()`` of every agent mid-turn — identity-keyed so the lookup is O(1) and independent of
         ``AIAgent.__eq__`` (MagicMock overrides it in tests)."""
@@ -4354,10 +4348,10 @@ def _housekeeping_misfire_catch_up(cron_provider, adapters, loop) -> None:
         logger.info("Misfire catch-up: fired %d overdue job(s)", caught_up)
 
 
-def _housekeeping_curator() -> None:
+def _housekeeping_curator(idle_fence=None) -> None:
     """The idle poll: the curator (gated by curator.interval_hours), then plugin idle tasks (their own intervals)."""
     from hermes_cli.plugins_idle_tasks import run_idle_jobs
-    run_idle_jobs(idle_for_seconds=float("inf"), on_summary=lambda msg: logger.info("curator: %s", msg))
+    run_idle_jobs(idle_for_seconds=float("inf"), on_summary=lambda msg: logger.info("curator: %s", msg), fence=idle_fence)
 
 
 def _housekeeping_plugin_update_check() -> None:
@@ -4446,9 +4440,9 @@ def _housekeeping_deferred_fts_retry() -> None:
 
 
 def _housekeeping_memory_trim() -> None:
-    """Messaging-gateway counterpart to the TUI idle reaper; config-gated and rate-limited inside."""
-    from hermes_cli.mem_trim import trim_memory
-    trim_memory(reason="messaging gateway housekeeping")
+    """Messaging-gateway counterpart to the TUI idle reaper; timer lane: full GC only once idle (#139763)."""
+    from hermes_cli.mem_trim import trim_memory_when_idle
+    trim_memory_when_idle(reason="messaging gateway housekeeping")
 
 
 def _housekeeping_checkpoint_prune() -> None:
@@ -4494,6 +4488,7 @@ def _start_gateway_housekeeping(
     from gateway.run_delivery_queue_watch import DRAIN_LABEL, DeliveryQueueWatch, wait_for_next_tick
     from gateway.run_profile_reconcile import _mcp_config_reconciler, profile_scoped_chore
     from gateway.run_housekeeping_disk import housekeeping_media_caches, maybe_post_auto_prune_prompt
+    from hermes_cli.plugins_idle_tasks import IdleTaskFence
     chores: list[tuple[int, str, Any]] = [
         # First every tick: re-stamp ``updated_at`` in gateway_state.json so it is a real heartbeat.
         # ``hermes gateway status`` / ``/api/status`` warn when it ages past 2x ``interval`` with the
@@ -4517,9 +4512,8 @@ def _start_gateway_housekeeping(
         # already ended (#111010). Runs every tick so the outage is bounded by one housekeeping interval.
         chores.append((1, "Cron ticker supervisor", cron_thread.restart_if_dead))
     chores += [
-        # Per served profile: each profile has its own skills tree, curator state, Nous login
-        # and state.db.
-        (60, "Curator tick", profile_scoped_chore(runner, _housekeeping_curator)),
+        # Per served profile: each has its own skills tree, curator state, Nous login and state.db.
+        (60, "Curator tick", profile_scoped_chore(runner, lambda: _housekeeping_curator(idle_fence))),
         (60, "state.db maintenance tick", profile_scoped_chore(
             runner,
             # Default-bound now, i.e. OUTSIDE any profile scope: this is the launch home's override.
@@ -4546,14 +4540,14 @@ def _start_gateway_housekeeping(
             served_homes, lambda: _drain_restart_safe_cron_deliveries(adapters, loop, runner))
 
     logger.info("Gateway housekeeping started (interval=%ds)", interval)
-    tick_count = 0
+    tick_count, idle_fence = 0, IdleTaskFence(stop_event)
     while not stop_event.is_set():
         tick_count += 1
         for every, label, fn in chores:
             if tick_count % every == 0:
                 _housekeeping_chore(label, fn)
         wait_for_next_tick(stop_event, interval, queue_watch, _housekeeping_chore)
-    logger.info("Gateway housekeeping stopped")
+    logger.info("Gateway housekeeping stopped (idle-task runs settled: %s)", idle_fence.close())
 
 
 def _start_cron_ticker(stop_event: threading.Event, adapters=None, loop=None, interval: int = 60):
@@ -5099,6 +5093,7 @@ def main():
     """CLI entry point for the gateway."""
     # Before any config-dependent startup (watchdog, DB opens, provider resolution).
     _guard_corrupt_user_config()
+    from hermes_cli.resource_limits import apply_malloc_arena_max  # runs before any thread (glibc latches)
 
     # Advertise the harness to children (mirrors _advertise_agent_env in hermes_cli/main.py, inlined to
     # avoid its startup side effects). Value must equal registry id ``hermes-agent`` exactly.
@@ -5122,13 +5117,12 @@ def main():
         from hermes_cli.stdio import configure_windows_stdio
         configure_windows_stdio()
 
-    for _step in (_register_identity, _arm_watchdog, _utf8_stdio):
+    for _step in (apply_malloc_arena_max, _register_identity, _arm_watchdog, _utf8_stdio):
         _best_effort(_step)
 
-    # pm startup contract (PATH provisioning for the store's tools), then
-    # the post-update bootstrap: the same one-pass record-gated maintenance
-    # registry the CLI dispatch path runs (hermes_cli/main.py) — this
-    # entrypoint bypasses that dispatch, so run it here too. Never raises.
+    # pm startup contract (PATH provisioning for the store's tools), then the post-update bootstrap: the
+    # same one-pass record-gated maintenance registry the CLI dispatch path runs (hermes_cli/main.py) —
+    # this entrypoint bypasses that dispatch, so run it here too. Never raises.
     try:
         from hermes_cli.venv_sync import check_runtime
         from pm.paths import install_root

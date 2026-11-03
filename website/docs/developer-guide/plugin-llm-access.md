@@ -633,6 +633,18 @@ plugin, and the turn-scoped `pre_api_request` /
 
 ## Forking the session's own agent (`ctx.fork_session`)
 
+:::caution Experimental
+`ctx.fork_session` and [`ctx.register_idle_task`](#idle-tasks-ctxregister_idle_task) are
+experimental. Their signatures and the fork handle's shape may change in a later release; keep
+the handle inside one small function of your plugin that returns plain data, and do not store it
+past the turn. Treat `fork_session` as optional: it returns `None` when the request is refused
+(no `llm.session_fork` grant, a bad, expired or spent token, a tool outside the allowlist), and it
+is not available everywhere. Under `plugins.isolation: host` a third-party plugin's
+`ctx.fork_session` exists but raises `PluginHostUnsupported` (a `RuntimeError`), because the handle
+tracks a thread of the live session agent inside the Hermes process. A plugin that degrades to
+"no fork" on `None` or an exception keeps working in both places.
+:::
+
 `ctx.side_question` gets one text reply. `ctx.fork_session` runs a
 bounded background copy of the session's agent instead: the same
 system prompt, `tools[]`, memory and conversation, on the warm prompt
@@ -748,7 +760,18 @@ when nothing was started.
   including from the fork's own tool handler) is the exception: it
   waits up to 120 seconds for the session's running background review
   and running forks to finish, then cancels whatever is still running,
-  so do not rely on an injected turn to cancel background work. The
+  so do not rely on an injected turn to cancel background work. A person
+  never waits behind that grace: a message a person sends to the session
+  while the injected turn waits ends the wait at once, whatever
+  `display.busy_input_mode` makes of it, and the background work is
+  cancelled as for any person's turn. A message that is queued (queue
+  mode, an interrupt, any message before the injected turn has an agent)
+  runs as its own turn after the injected one, in the order they
+  arrived; a steer (steer mode or `/steer`) or an interrupt-mode
+  correction that redirects the turn goes into the injected turn itself.
+  Another plugin's injected message does not end the wait. A gateway
+  shutdown, restart or profile retirement ends the wait the same way,
+  inside the shutdown's drain budget. The
   injected turn starts from the gateway's own context: its tool calls
   carry no `turn_origin`, even when the fork injected it. `timeout`
   (seconds, at most 1800) adds a wall clock. Both are cooperative:
@@ -797,6 +820,34 @@ Usage is billed to the session as `plugin_fork:<plugin id>`. Each of the
 fork's provider requests fires `pre_auxiliary_call` /
 `post_auxiliary_call` with `aux_task="plugin_fork"` and `plugin_id`, never
 the turn-scoped `pre_api_request` / `post_api_request`.
+
+## Idle tasks (`ctx.register_idle_task`)
+
+Experimental, like `fork_session` (see the note [above](#forking-the-sessions-own-agent-ctxfork_session)).
+`ctx.register_idle_task(name, fn, *, interval_hours, min_idle_hours=2, first_run="defer")` runs a
+session-less job of the plugin on the skill curator's idle schedule; the full rules are in
+[Run a job when Hermes is idle](./plugins/index.md#run-a-job-when-hermes-is-idle-ctxregister_idle_task).
+The contract a task's `fn` is written against:
+
+* `fn` runs on its own thread, in the profile that registered it. The host's poll (gateway
+  housekeeping, CLI/TUI startup, the `hermes serve` maintenance tick) starts it and returns at
+  once; it never waits for the run and sets no time limit of its own.
+* Keep a run short: give it its own time limit, and work in small batches with a checkpoint in the
+  plugin's data so the next run picks up where this one stopped.
+* Keep a run idempotent: a run cut off by a restart leaves no record and runs again later from the
+  start, so running the same batch twice must do no harm.
+* When gateway housekeeping stops (gateway shutdown, or the multiplexer restarting in the same
+  process), no new run starts and the gateway waits a few seconds for a run in flight, then stops
+  without it. Plugin code cannot be stopped and `fn` gets no stop signal, so a run still going goes
+  on in the background; when it ends it records nothing (the task's state stays as it was before
+  the run, so the task runs again later) and releases its claim. Hermes guarantees only that no
+  run starts and no task state is written after the stop; keep a run short.
+* No second run of a task starts while one is in flight. A claim whose process has died (a crash
+  or a kill) is taken over at the next poll; a claim whose owner cannot be checked (one written on
+  another machine) counts as abandoned after an hour. An exception is caught, logged and recorded as
+  `last_status: error`; it never reaches the host.
+* Model calls from `fn` go through `ctx.llm` and its trust gate. `fn` has no turn, so it gets no
+  `side_question_token` and cannot fork the session.
 
 ## Where this fits in the plugin surface
 

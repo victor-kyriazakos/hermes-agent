@@ -362,3 +362,205 @@ async def test_an_interrupt_of_the_session_agent_ends_the_injected_turns_wait(mo
         assert await asyncio.to_thread(bg.handle.wait, 10)
 
     assert (bg.handle.outcome, bg.fork.interrupted) == ("cancelled", True)
+
+
+# A person must never inherit the injected turn's grace: input arriving behind a plugin turn already
+# waiting for the session's background work ends that wait at once, and so does a gateway drain.
+# The background work is then superseded the way a person's turn always supersedes it.
+
+FAR_INSIDE_THE_GRACE = 5.0  # seconds; the grace is 120 s
+
+
+@pytest.mark.asyncio
+async def test_a_person_arriving_while_an_injected_turn_waits_does_not_inherit_its_grace(
+        monkeypatch, probe, caplog):
+    """Running review + fork, the plugin's admission claimed and waiting for them, THEN the person's
+    message: the person's turn starts without waiting out the grace (it waited all of it)."""
+    import time
+
+    from gateway.platforms.event import MessageEvent
+
+    caplog.set_level(logging.INFO, logger="agent.background_review")
+    async with _gateway_session(monkeypatch, probe):
+        bg = await _start_background_work(monkeypatch, probe)
+        assert probe.ctx.inject_message(PROMPT, session_key=probe.session_key) is True
+        await async_wait_until(lambda: WAITS in caplog.text, timeout=10, what="the injected turn's wait")
+        waiting = (PROMPT in probe.turns, bg.refine.review.interrupted, bg.fork.interrupted)
+
+        arrived = time.monotonic()
+        await probe.adapter.handle_message(MessageEvent(text="B", source=probe.source, message_id="B"))
+        await async_wait_until(lambda: "B" in probe.turns, timeout=FAR_INSIDE_THE_GRACE,
+                               what="the person's turn, inside the grace")
+        started_after = time.monotonic() - arrived
+        assert await asyncio.to_thread(bg.handle.wait, 10)
+        bg.refine.thread.join(10)
+
+    assert waiting == (False, False, False) and started_after < FAR_INSIDE_THE_GRACE
+    # FIFO order kept; the background work superseded, as a person's turn supersedes it.
+    assert (probe.turns, bg.refine.outcome, bg.handle.outcome, bg.fork.interrupted) == (
+        ["A", PROMPT, "B"], ["cancelled"], "cancelled", True)
+
+
+def _queued(probe, count):
+    from hermes_state_runtime import list_session_admissions
+
+    authority = probe.adapter.gateway_runner.session_authority
+    sid = authority.logical_owner(authority.runner.session_store.lookup_by_session_key(probe.session_key).session_id)
+    return sum(row["status"] == "queued" for row in list_session_admissions(authority.db, session_id=sid)) == count
+
+
+@pytest.mark.asyncio
+async def test_a_person_already_queued_behind_the_plugins_message_ends_its_wait_as_it_begins(
+        monkeypatch, probe, caplog):
+    """The person's message committed before the plugin's turn was claimed: the wait ends as it
+    starts, the person's turn follows the plugin's without sitting out the grace."""
+    from gateway.platforms.event import MessageEvent
+
+    caplog.set_level(logging.INFO, logger="agent.background_review")
+    async with _gateway_session(monkeypatch, probe):
+        bg = await _start_background_work(monkeypatch, probe)
+        async with probe.session.claim_gate:  # no claim until both inputs are queued
+            assert probe.ctx.inject_message(PROMPT, session_key=probe.session_key) is True
+            await async_wait_until(lambda: _queued(probe, 1), timeout=10, what="the plugin's message queued")
+            await probe.adapter.handle_message(MessageEvent(text="B", source=probe.source, message_id="B"))
+            await async_wait_until(lambda: _queued(probe, 2), timeout=10, what="the person's message queued")
+        await async_wait_until(lambda: "B" in probe.turns, timeout=FAR_INSIDE_THE_GRACE,
+                               what="the person's turn, inside the grace")
+        assert await asyncio.to_thread(bg.handle.wait, 10)
+        bg.refine.thread.join(10)
+
+    assert (probe.turns, bg.refine.outcome, bg.handle.outcome) == (["A", PROMPT, "B"], ["cancelled"], "cancelled")
+
+
+@pytest.mark.asyncio
+async def test_another_plugin_message_does_not_end_the_wait(monkeypatch, probe, caplog):
+    """Only a person supersedes: a second plugin message queued behind the waiting one lets the
+    review and fork finish too."""
+    caplog.set_level(logging.INFO, logger="agent.background_review")
+    async with _gateway_session(monkeypatch, probe):
+        bg = await _start_background_work(monkeypatch, probe)
+        assert probe.ctx.inject_message(PROMPT, session_key=probe.session_key) is True
+        await async_wait_until(lambda: WAITS in caplog.text, timeout=10, what="the injected turn's wait")
+        assert probe.ctx.inject_message(PROMPT, session_key=probe.session_key) is True
+        # ``rescan`` is set by the second message's arrival signal, which wakes the wait in the same step.
+        await async_wait_until(lambda: probe.session.rescan, timeout=10, what="the second message's arrival")
+        still_waiting = (probe.session.background_wait.is_set(), bg.refine.review.interrupted, probe.turns[1:])
+        bg.refine.review.stop.set()
+        bg.fork.stop.set()
+        await async_wait_until(lambda: probe.turns.count(PROMPT) == 2, timeout=10, what="both plugin turns")
+        assert await asyncio.to_thread(bg.handle.wait, 10)
+        bg.refine.thread.join(10)
+
+    assert still_waiting == (False, False, [])
+    assert (bg.refine.outcome, bg.handle.outcome) == (["completed"], "ok")
+
+
+# Every busy control a person's message is accepted as ends the wait at the point it is accepted:
+# queued behind the plugin's turn (queue mode, an ordinary interrupt) or taken into it (a steer, an
+# active-turn redirect, neither ever queued). The background work is then superseded at once.
+
+WELL_INSIDE_THE_GRACE = 1.0  # seconds; the grace is 120 s
+
+# control -> (busy_input_mode, the agent redirects its active turn, the person's text runs as its own
+# turn, what the person sends)
+_BUSY_CONTROLS = {
+    "queue": ("queue", False, True, "B"),
+    "steer": ("steer", False, False, "B"),
+    "interrupt": ("interrupt", False, True, "B"),
+    "redirect": ("interrupt", True, False, "B"),
+    "/steer": ("queue", False, False, "/steer B"),
+}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("waits_in", ["the resident agent's turn", "the authority's /refine cancel"])
+@pytest.mark.parametrize("control", list(_BUSY_CONTROLS))
+async def test_every_busy_control_a_person_sends_ends_the_wait(monkeypatch, probe, caplog, control, waits_in):
+    import time
+
+    from gateway.platforms.event import MessageEvent
+
+    mode, redirects, own_turn, sent = _BUSY_CONTROLS[control]
+    refine = waits_in == "the authority's /refine cancel"
+    caplog.set_level(logging.INFO, logger="agent.background_review")
+    async with _gateway_session(monkeypatch, probe) as runner:
+        bg = await _start_background_work(monkeypatch, probe)
+        if not refine:
+            bg.refine.review.stop.set()
+            bg.refine.thread.join(10)
+        assert probe.ctx.inject_message(PROMPT, session_key=probe.session_key) is True
+        await async_wait_until(lambda: WAITS in caplog.text, timeout=10, what="the injected turn's wait")
+
+        # The resident agent running the plugin's turn holds the session's running slot and takes the
+        # person's control as a live one does. While the authority still waits to claim the turn
+        # there is no agent to steer or redirect, so any busy mode queues the person's text.
+        controls = []
+
+        def take(text):
+            controls.append(text)
+            return True
+
+        def interrupt(text=None):
+            controls.append(text)
+            bg.parent._interrupt_requested = True
+
+        bg.parent.steer = bg.parent.redirect = take
+        bg.parent.interrupt = interrupt
+        bg.parent._supports_active_turn_redirect = redirects
+        runner._busy_input_mode = mode
+        if not refine:
+            runner._session_state(probe.session_key).turn.agent = bg.parent
+        own_turn = own_turn or refine
+        waiting = (probe.session.background_wait.is_set(), bg.refine.review.interrupted, bg.fork.interrupted)
+
+        arrived = time.monotonic()
+        await probe.adapter.handle_message(MessageEvent(text=sent, source=probe.source, message_id="B"))
+        await async_wait_until(lambda: bg.fork.interrupted and (bg.refine.review.interrupted or not refine),
+                               timeout=FAR_INSIDE_THE_GRACE, what="the background work superseded")
+        superseded_after = time.monotonic() - arrived
+        await async_wait_until(lambda: PROMPT in probe.turns and ("B" in probe.turns or not own_turn),
+                               timeout=10, what="the turns")
+        assert await asyncio.to_thread(bg.handle.wait, 10)
+        bg.refine.thread.join(10)
+
+    assert waiting == (False, False, False) and superseded_after < WELL_INSIDE_THE_GRACE
+    assert (len(controls), probe.turns, bg.handle.outcome, bg.refine.outcome) == (
+        int(control != "queue" and not refine), ["A", PROMPT, "B"] if own_turn else ["A", PROMPT],
+        "cancelled", ["cancelled" if refine else "completed"])
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("stop", ["gateway drain", "profile retirement"])
+@pytest.mark.parametrize("waits_in", ["the resident agent's turn", "the authority's /refine cancel"])
+async def test_a_gateway_drain_ends_an_injected_turns_wait_before_the_drain_budget(
+        monkeypatch, probe, caplog, waits_in, stop):
+    """Shutdown or profile retirement while the injected turn waits (on either path a turn
+    supersedes background work): the wait ends at once, the work it waited for is superseded, and
+    the session's drain settles well inside the settle budget instead of sitting out the grace."""
+    import time
+
+    from gateway.run_runtime import STOP_TAIL_RESERVE_SECONDS, _retire_profile_authority, settle_gateway_runtime
+
+    caplog.set_level(logging.INFO, logger="agent.background_review")
+    async with _gateway_session(monkeypatch, probe) as runner:
+        bg = await _start_background_work(monkeypatch, probe)
+        if waits_in == "the resident agent's turn":
+            bg.refine.review.stop.set()
+            bg.refine.thread.join(10)
+        assert probe.ctx.inject_message(PROMPT, session_key=probe.session_key) is True
+        await async_wait_until(lambda: WAITS in caplog.text, timeout=10, what="the injected turn's wait")
+
+        stopping = time.monotonic()
+        if stop == "gateway drain":
+            runner._draining = True  # what stop() sets first (_stop_begin_teardown)
+            await settle_gateway_runtime(runner, STOP_TAIL_RESERVE_SECONDS + 20.0)
+        else:
+            assert await _retire_profile_authority(runner.session_authority, timeout=20.0)
+        settled_after = time.monotonic() - stopping
+        superseded = (bg.refine.outcome if waits_in == "the authority's /refine cancel"
+                      else [await asyncio.to_thread(bg.handle.wait, 10) and bg.handle.outcome])
+        bg.fork.stop.set()
+        bg.refine.thread.join(10)
+
+    assert settled_after < FAR_INSIDE_THE_GRACE and probe.session.task.done()
+    assert superseded == (["cancelled"])
