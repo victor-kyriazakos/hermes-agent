@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """Classify a PR's changed files into CI work lanes.
 
-Reads newline-separated changed paths on stdin and writes ``key=value``
+Reads changed paths on stdin, one file per line (a renamed file as
+``path<TAB>old path``), and writes ``key=value``
 booleans (one per lane) to ``$GITHUB_OUTPUT`` and stdout. The
 ``detect-changes`` composite action consumes them so steps gate on
 ``if: steps.changes.outputs.<lane> == 'true'``.
@@ -104,9 +105,14 @@ _WHATSAPP_BRIDGE = ("scripts/whatsapp-bridge/", "plugins/platforms/whatsapp/")
 # Shift every package's tree (pnpm-workspace.yaml carries the overrides).
 _ROOT_NPM = {"package.json", "pnpm-lock.yaml", "pnpm-workspace.yaml"}
 _DOCKER_META = ("docker/", ".hadolint.yaml", "Dockerfile", ".dockerignore") # docker setup
+# The docker_meta lint step runs it; it is not an image input, so it builds no image.
+_DOCKER_LINT = "scripts/ci/lint_docker.sh"
 _NIX_PATHS = ("nix/",) # nix files
 _NIX_FILES = {"flake.nix", "flake.lock"} # base nix files
 _SITE = ("website/", "skills/", "optional-skills/")  # docs site + skill pages
+# CI configuration outside .github/: workflows run their commands as just recipes
+# through this wrapper, so a change here can break any lane, as a workflow edit can.
+_CI_CONFIG_FILES = {"justfile", "scripts/hermes-python"}
 # Prose/frontend trees that can't touch Python. skills/ is excluded on purpose.
 _PY_SKIP = ("docs/", "website/") + _FRONTEND
 # Published artifacts that live under website/ but that Python asserts about.
@@ -272,6 +278,7 @@ _DESKTOP_E2E_SHARED = (
 _UPDATE_PIPELINE = (
     "hermes_cli/main.py",  # cmd_update: lock, pre-update backup, receipt boundary
     "hermes_cli/main_dashboard.py",  # hangup protection + update.log mirror
+    "hermes_cli/main_web_build.py",  # completion's bytecode sweep and dropped-folder prune
     # Prefix: main_desktop.py (staged Desktop swap / rebuild in the tail) and the
     # main_desktop_* siblings it imports (macOS signing identity).
     "hermes_cli/main_desktop",
@@ -651,7 +658,7 @@ def classify(files: list[str], run_e2e: bool = False) -> dict[str, bool]:
     )
     deps = any(f == "pyproject.toml" for f in files)
     npm_lock = any(f.split("/")[-1] in ("pnpm-lock.yaml", "package-lock.json") for f in files)
-    docker_meta = any(f.startswith(_DOCKER_META) for f in files)
+    docker_meta = any(f.startswith(_DOCKER_META) or f == _DOCKER_LINT for f in files)
     
     ret = {
         "python": python,
@@ -677,7 +684,7 @@ def classify(files: list[str], run_e2e: bool = False) -> dict[str, bool]:
         inherited = classify(consumers)
         for lane in _FIXTURE_CONSUMER_LANES:
             ret[lane] = ret[lane] or inherited[lane]
-    if not files or any(f.startswith(".github/") for f in files):
+    if not files or any(f.startswith(".github/") or f in _CI_CONFIG_FILES for f in files):
         ret["python"] = True
         ret["python_prod"] = True
         ret["docker_meta"] = True
@@ -750,7 +757,8 @@ def pull_request_changed_files() -> list[str]:
     pr = _pull_request_number()
     if not repo or not pr:
         return []
-    return _gh_lines("api", "--paginate", f"repos/{repo}/pulls/{pr}/files", "--jq", ".[].filename") or []
+    return _gh_lines("api", "--paginate", f"repos/{repo}/pulls/{pr}/files", "--jq",
+                     ".[] | [.filename, .previous_filename // empty] | @tsv") or []
 
 
 def pull_request_labels() -> list[str]:
@@ -772,9 +780,26 @@ def pull_request_labels() -> list[str]:
     return [label["name"] for label in labels if isinstance(label, dict) and label.get("name")]
 
 
+# The compare API lists at most this many files and drops the rest without saying so.
+COMPARE_FILE_CAP = 300
+
+
+def changed_paths(lines: list[str]) -> list[str]:
+    """Paths from lines of ``path`` or ``path<TAB>old path``; ``[]`` (every lane runs) at the cap.
+
+    A rename counts under both names: a lane keyed on the old location still has to see a file move
+    away from it."""
+    lines = [line for line in lines if line.strip()]
+    if len(lines) >= COMPARE_FILE_CAP:
+        print(f"{len(lines)} changed files reached the compare API's {COMPARE_FILE_CAP}-file cap; "
+              "the list may be cut short, so every lane runs", file=sys.stderr)
+        return []
+    return [path for line in lines for path in line.split("\t") if path.strip()]
+
+
 def main() -> int:
-    files = sys.stdin.read().splitlines()
-    if not any(f.strip() for f in files):
+    lines = sys.stdin.read().splitlines()
+    if not any(f.strip() for f in lines):
         recovered = pull_request_changed_files()
         if recovered:
             print(
@@ -782,7 +807,8 @@ def main() -> int:
                 "path(s) from the pull request files endpoint",
                 file=sys.stderr,
             )
-            files = recovered
+            lines = recovered
+    files = changed_paths(lines)
     lanes = classify(files, run_e2e=RUN_E2E_LABEL in pull_request_labels())
     out = "\n".join(f"{key}={str(value).lower()}" for key, value in lanes.items())
     if dest := os.environ.get("GITHUB_OUTPUT"):

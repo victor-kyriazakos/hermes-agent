@@ -121,7 +121,35 @@ def prepare_launch_dependencies(project_root: Path, *, env: dict) -> None:
     desktop_dir = project_root / "apps/desktop"
     desktop = _desktop_dist_exists(desktop_dir) or _desktop_packaged_executable(desktop_dir) is not None
     workspaces = ("ui-tui", "web") + (("apps/desktop",) if desktop else ())
+    # Someone is waiting for this launch, which falls back to the previous build when it fails:
+    # offline, pnpm's default retries spend ~70 s before failing, one retry ~10 s.
+    if not _fetch_retries_configured(project_root, env):
+        env = {**env, "pnpm_config_fetch_retries": "1"}
     prepare_source_dependencies(project_root, workspaces, env=env)
+
+
+def _fetch_retries_configured(project_root: Path, env: dict) -> bool:
+    """Whether the user chose a download retry count where pnpm 12 reads one:
+    ``pnpm_config_fetch_retries``, pnpm's global config.yaml or pnpm-workspace.yaml. pnpm 12 reads
+    no ``fetch-retries`` from an npmrc nor ``npm_config_fetch_retries``, so neither counts. A pnpm
+    that cannot answer counts as configured: the default stays."""
+    if any(key.lower() == "pnpm_config_fetch_retries" for key in env):
+        return True
+    from hermes_platform.resolver import LookupContext, locate_command
+
+    # The PATH of the env PM's ensure("pnpm") composed, never this process's.
+    found = locate_command("pnpm", LookupContext(path=env["PATH"])).command
+    if not found:
+        return True
+    pnpm = found[0]
+    try:
+        answer = subprocess.run(
+            [pnpm, "config", "get", "fetchRetries", "--json"], cwd=project_root, env=env,
+            capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=30, check=True,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return True
+    return answer.stdout.strip() != "null"
 
 
 def build_source_tui(project_root: Path, *, env: dict) -> None:
@@ -172,11 +200,13 @@ def _headless_linux() -> bool:
     return sys.platform.startswith("linux") and not (os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY"))
 
 
-def build_update_products(project_root: Path, *, desktop: bool) -> None:
+def build_update_products(project_root: Path, *, desktop: bool, after_dependencies=None) -> None:
     """Prepare the selected union once, attempting every independent product.
 
     A failed product never skips the next one (a broken web build must not leave the TUI or the
     desktop app stale); the failures are raised together at the end as ``ProductBuildError``.
+    ``after_dependencies`` (it must not raise) runs once the Python and Node dependencies are
+    prepared, whether or not they succeeded, and before the first product build.
     """
     # Both current updates and historical takeover reach this in a fresh target
     # interpreter, never in the updater's pre-sync import graph.
@@ -197,6 +227,8 @@ def build_update_products(project_root: Path, *, desktop: bool) -> None:
 
     attempt("feature dependencies", lambda: _install_configured_features_missing_deps(project_root))
     frontends = source_frontends(project_root)
+    if not frontends and after_dependencies is not None:
+        after_dependencies()
     if frontends:
         desktop_built = False
         env: dict = {}
@@ -221,6 +253,8 @@ def build_update_products(project_root: Path, *, desktop: bool) -> None:
             prepared = desktop_skipped = attempt("Node dependencies", lambda: node_dependencies(frontends))
             if desktop_skipped:
                 failures.append(("desktop dependencies", failed[1]))
+        if after_dependencies is not None:
+            after_dependencies()
         desktop_reason = failures[-1][0] if failures else ""
         if desktop and (desktop_skipped or _headless_linux()):
             print("  ⓘ If this host never runs the desktop app, `hermes uninstall --gui` removes it "

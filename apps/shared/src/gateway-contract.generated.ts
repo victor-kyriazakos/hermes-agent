@@ -2139,7 +2139,7 @@ export interface ProfileCanonicalSession {
   message_count?: number
   live_message_count?: number | null
 }
-/** ``clone_from`` omitted = fresh profile + bundled skills; ``mirror_credentials`` defaults on so a headless bot has a provider. */
+/** ``clone_from`` omitted = fresh profile + bundled skills; ``mirror_credentials`` and ``share_auth`` default on (the bot page's defaults) so a headless bot has a provider. */
 export interface ProfilesCreateParams {
   profile?: string | null
   name: string
@@ -2162,8 +2162,9 @@ export interface ProfilesCreateResult {
   soul_written?: boolean
   model_set?: boolean
   mirrored: ProfileMirrored
+  warnings?: string[]
 }
-/** What was copied from the launch profile; ``auth`` is ``"shared"`` under ``share_auth``. */
+/** What was copied from the launch profile; ``auth`` is ``"shared"`` when the new profile has no auth.json of its own and reads the default root's. */
 export interface ProfileMirrored {
   env?: boolean
   auth?: boolean | 'shared'
@@ -2321,6 +2322,7 @@ export interface VaultItem {
   identifier?: string | null
   identifier_type?: string | null
   has_otp?: boolean | null
+  allowed_origins?: string[] | null
   backend: string
 }
 export interface VaultSourcesResult {
@@ -2352,6 +2354,20 @@ export interface VaultUnlockParams {
 export interface VaultUnlockResult {
   name: string
   unlocked?: boolean
+}
+/** ``target`` is the opaque binding the renderer minted for one in-app browser tab. */
+export interface VaultPreviewFillParams {
+  profile?: string | null
+  handle: string
+  target: string
+}
+/** Counts and the page origin only: never a secret. */
+export interface VaultPreviewFillResult {
+  success: boolean
+  filled_fields?: number | null
+  origin?: string | null
+  error?: string | null
+  error_type?: string | null
 }
 export interface VaultLockParams {
   profile?: string | null
@@ -5697,6 +5713,13 @@ export interface PreviewActRequestParams {
   amount?: number | null
   max?: number | null
   allow_shortcut?: boolean | null
+  vault?: PreviewVaultOperation | null
+}
+/** Internal vault transport, never arguments exposed to the model. */
+export interface PreviewVaultOperation {
+  operation: 'open' | 'evaluate' | 'close'
+  target?: string | null
+  expression?: string | null
 }
 /** ``tools/tour_tool.py`` field set. */
 export interface TourRequestParams {
@@ -6743,6 +6766,8 @@ export interface RpcMethods {
   'vault.list': { params: ProfileParams; result: VaultListResult }
   /** Forget a manager's session token (every manager when no name is given). */
   'vault.lock': { params: VaultLockParams; result: VaultLockResult }
+  /** Fill a saved login into the in-app browser tab the renderer pinned (never submits). */
+  'vault.preview.fill': { params: VaultPreviewFillParams; result: VaultPreviewFillResult }
   /** Remove a local vault item by id. */
   'vault.remove': { params: VaultRemoveParams; result: VaultRemoveResult }
   /** Enable or disable an external password manager (disabling also locks it). */
@@ -7021,6 +7046,7 @@ export const RPC_METHODS = [
   'vault.add',
   'vault.list',
   'vault.lock',
+  'vault.preview.fill',
   'vault.remove',
   'vault.source.set',
   'vault.sources',
